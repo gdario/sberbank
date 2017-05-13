@@ -8,24 +8,10 @@ R := R CMD BATCH --no-save
 %.Rout: %.R
 	  $(R) $<
 
-# Select the most important features
-#select_features.Rout: create_dummies.Rout
-
-# Create dummy variables for the multi-category columns
-#create_dummies.Rout: add_new_features.Rout
-
-# Add new features (to the training set only)
-# add_new_features.Rout: clean_columns.Rout
-
-# Clean the columns that have the wrong data types etc.
-#clean_columns.Rout: select_columns.Rout
-
-# Remove the columns that are unlikely to contribute. Note, no NA
-# filtering is performed here.
-#select_columns.Rout: merge_with_macro.Rout
-
-clean_trianing_set.Rout: 
-# merge_with_macro.Rout:
+xgb_complete.Rout: create_val_set.Rout create_submission.R
+create_val_set.Rout: preprocess_macro.Rout
+preprocess_macro.Rout: preprocess_train_and_test.Rout
+preprocess_train_and_test.Rout: clean_dataset.R
 
 clean:
 		rm -f *.Rout
