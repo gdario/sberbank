@@ -1,0 +1,61 @@
+# Further modification to the training and test sets
+
+We start adding some time specific variables
+
+```{r}
+library(magrittr)
+library(tidyverse)
+load("../output/08-final_dataset.RData")
+train_set %<>% mutate(
+  year = lubridate::year(timestamp),
+  month = lubridate::month(timestamp)
+)
+test_set %<>% mutate(
+  year = lubridate::year(timestamp),
+  month = lubridate::month(timestamp)
+)
+```
+
+## A First Test Submission
+
+We create one single submission to have an idea of how far the training set and the test set are.
+
+```{r, cache=TRUE, results="hide"}
+library(xgboost)
+params <- list(
+  eta = 0.1, 
+  gamma = 1,
+  max_depth = 5,
+  min_child_weight = 1,
+  subsample = 0.9,
+  colsample_bytree = 0.9,
+  objective = "reg:linear"
+)
+tmp <- select(train_set, -c(id, timestamp))
+dTr <- xgb.DMatrix(as.matrix(tmp), 
+                   label = log(1 + prices$price_doc))
+dTe <- xgb.DMatrix(as.matrix(tmp))
+set.seed(123)
+cv <- xgb.cv(params = params, data = dTr, nrounds = 300, nfold = 5)
+min_rmse <- round(min(cv$evaluation_log$test_rmse_mean), 5)
+rmse_sd <- round(cv$evaluation_log$test_rmse_std[
+  which.min(cv$evaluation_log$test_rmse_mean)
+], 5)
+tr <- xgb.train(
+  params = params, 
+  data = dTr, 
+  nrounds = which.min(cv$evaluation_log$test_rmse_mean)
+)
+preds <- predict(object = tr, newdata = dTe)
+submission <- tibble(id = test_set$id, price_doc = exp(preds))
+readr::write_csv(submission, path = "../output/test_submission.csv")
+```
+
+This run has produced a CV RMSE +/- SD of `r min_rmse` +/- 
+`r rmse_sd`. In contrast, the submission produces an RMSE of 0.36390 on the public LB.
+
+## Possible Things to Try
+
+1. Remove the low-price transactions
+2. Remove the first year and use only the other ones to cross-validate.
+3. Try adversarial training.

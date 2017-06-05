@@ -1,0 +1,11 @@
+# Introduction
+
+The Sberbank Kaggle competition consists in predicting the price of houses in a
+given period of time (from 2015-07-01 to 2016-05-30). Predictors can be roughly
+categorized into apartment/building specific, raion (area or district)
+specific, population/demographic data, and macro-economic indicators. There are
+more than 290 predictors overall, many of which stronly correlated. One
+important characteristic of this dataset is the large number of missing values,
+that occurr in non-random patterns. For some predictors more than 40% of the
+values are missing, and imputation has little change of succeeding, since all
+the values are missing within the same time interval.

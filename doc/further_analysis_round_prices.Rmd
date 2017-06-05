@@ -1,0 +1,169 @@
+# Further analysis of the round-priced transactions
+
+We start adding the indicator variables for the 1M, 2M and 3M transactions. We want to understand whether there are raion-related patterns. For example, are this type of transactions more frequent in specific raions?
+
+```{r}
+library(magrittr)
+library(tidyverse)
+load("../output/08-final_dataset.RData")
+
+prices %<>% mutate(
+  round_price = as.numeric(price_doc %in% (c(1:3) * 1e6)),
+  price_1m = price_doc == 1e06,
+  price_2m = price_doc == 2e06,
+  price_3m = price_doc == 3e06
+)
+```
+
+I have checked whether the transactions with round prices take place always in the same raions, and it's not the case. I'm skipping this part of the code for brevity.
+
+## Relative frequency of the round-priced transactions
+
+```{r, rel_freq}
+round_prices <- prices %>%
+  group_by(year) %>%
+  summarise(
+    p_1m = sum(price_1m) / n(),
+    p_2m = sum(price_2m) / n(),
+    p_3m = sum(price_3m) / n()
+  ) %>%
+  gather(key = parameter, value = percentage, p_1m:p_3m)
+```
+
+Let's plot these results and see whether there's a pattern through time.
+
+```{r}
+p <- ggplot(
+  data = round_prices,
+  aes(x = year, y = percentage, fill = parameter)
+  ) +
+  geom_bar(stat = "identity", position = "dodge")
+print(p)
+```
+
+## Subsampling strategy
+
+We can, to be a bit conservative, take the average proportions for each type of round price from the last two years.
+
+```{r last_two_years}
+mean_14_16 <- round_prices %>% filter(year > 2013) %>%
+  group_by(parameter) %>%
+  summarise(mean_p = mean(percentage))
+print(mean_14_16)
+```
+
+We now want to subsample the whole training set such that the round-priced transactions are present in these proportions. We don't modify the fraction of 3M prices because the estimated proportion is higher than the actual one.
+
+```{r}
+N <- nrow(train_set)
+
+normal_prices <- filter(prices, round_price == 0)
+
+prices_1m <- filter(prices, price_doc == 1e06)
+prices_2m <- filter(prices, price_doc == 2e06)
+prices_3m <- filter(prices, price_doc == 3e06)
+
+sub_price_1m <- sample_n(prices_1m, round(N * mean_14_16$mean_p[1]))
+sub_price_2m <- sample_n(prices_2m, round(N * mean_14_16$mean_p[2]))
+# sub_price_1m <- sample_n(prices_3m, round(N * mean_14_16$mean_p[3]))
+```
+
+We now create a new training set containing these subsets
+
+```{r}
+prices <- bind_rows(
+  normal_prices,
+  sub_price_1m,
+  sub_price_2m,
+  prices_3m
+)
+
+sub_train_set <- train_set %>% filter(id %in% prices$id)
+```
+
+Let's verify that this is what we want
+
+```{r}
+prices %>%
+  summarise(
+    p_1m = sum(price_1m) / n(),
+    p_2m = sum(price_2m) / n(),
+    p_3m = sum(price_3m) / n()
+  ) 
+```
+
+We save the subsampled training set in a new RData file.
+
+```{r}
+sub_train_set %<>% arrange(timestamp)
+prices %<>% select(id:sub_area) %>% 
+  arrange(timestamp)
+```
+
+## XGBoost model
+
+```{r}
+library(xgboost)
+val_set <- sub_train_set %>% filter(timestamp >= "2015-02-01")
+prices_val <- prices %>% filter(id %in% val_set$id)
+
+sub_train_set %<>% filter(timestamp < "2015-02-01")
+prices_train <- prices %>% filter(id %in% sub_train_set$id)
+
+X_tr <- sub_train_set %>%
+  mutate(year = lubridate::year(timestamp)) %>%
+  select(-c(id, timestamp)) %>% as.matrix()
+X_val <- val_set %>% 
+  mutate(year = lubridate::year(timestamp)) %>%
+  select(-c(id, timestamp)) %>% as.matrix()
+X_test <- test_set %>%
+  mutate(year = lubridate::year(timestamp)) %>%
+  select(-c(id, timestamp)) %>% as.matrix()
+X_train <- rbind(X_tr, X_val)
+
+y_tr <- log(1 + prices_train$price_doc)
+y_val <- log(1 + prices_val$price_doc)
+y_train <- c(y_tr, y_val)
+
+dTr <- xgb.DMatrix(X_tr, label = y_tr)
+dVal <- xgb.DMatrix(X_val, label = y_val)
+dTrain <- xgb.DMatrix(X_train, label = y_train)
+dTe <- xgb.DMatrix(X_test)
+```
+
+Model fit 
+
+```{r, results="hide"}
+watchlist <- list(eval = dVal, train = dTr)
+
+param <- list(
+  eta = 0.1,
+  nthread = 4,
+  objective = "reg:linear",
+  eval_metric = "rmse",
+  gamma = 1,
+  max_depth = 4,
+  min_child_weight = 1,
+  subsample = .8,
+  colsample_by_tree = .8
+)
+
+tr <- xgb.train(
+  params = param, 
+  data = dTr, 
+  nrounds = 300, 
+  watchlist = watchlist
+)
+
+```
+
+```{r}
+pred_val <- predict(tr, dVal)
+res_df <- tibble(y_val, pred_val)
+p <- ggplot(res_df, aes(x = y_val, y = pred_val)) +
+  geom_point(alpha = 0.1) + 
+  geom_abline(slope = 1, intercept = 0) +
+  geom_smooth()
+print(p)
+```
+

@@ -1,0 +1,133 @@
+# The Essential Dataset
+
+We take on from where we left in the previous section, and further explore the variables selected so far.
+
+## Splitting the datasets
+
+```{r}
+library(magrittr)
+library(tidyverse)
+load("../output/02-data_exploration.RData")
+train <- filter(cleaned_train_test_macro, 
+                dataset == "training_set")
+test <- filter(cleaned_train_test_macro, 
+               dataset == "test_set")
+stopifnot(all.equal(prices$id, train$id))
+y_train <- log(1 + prices$price_doc)
+train$dataset <- test$dataset <- NULL
+```
+
+```{r}
+essential <- select(train, full_sq:indust_part, week, month, 
+                    state, material, product_type, rel_floor,
+                    sub_area, ecology)
+raion <- select(train, timestamp, contains('raion'))
+demographic <- select(train, timestamp, female_f:`7_14_male`, 
+                      full_dens:work_dens)
+macro <- select(train, timestamp, oil_urals:apartment_build) %>%
+  distinct()
+area_cols <-   setdiff(
+  names(train), c(names(essential), 
+                  names(raion), 
+                  names(demographic), 
+                  names(macro))
+)
+area <- select(train, timestamp, one_of(area_cols)) %>%
+  select(-c(id, timestamp))
+save(essential, raion, demographic, macro, area, y_train, prices,
+     file = "../output/essential_aera_raion_demo_macro.RData")
+```
+
+## The Essential Dataset
+
+We create a data frame containing the average price per square meter in the various raions, including the information on the product type, the year, and the number of transactions for that combination of year, product type and sub-area.
+
+```{r}
+prices %<>% mutate(year = lubridate::year(timestamp))
+df_essential <- essential
+df_essential$price <- y_train
+df_essential$year <- prices$year
+df_essential %<>% mutate(price_per_sqm = price / full_sq)
+
+mean_prices <- df_essential %>%
+  group_by(year, product_type, sub_area) %>% 
+  summarise(n_transactions = n(), 
+            mean_price_per_sqm = mean(price_per_sqm, na.rm = TRUE)) %>%
+  arrange(year, product_type, desc(mean_price_per_sqm))
+```
+
+It can be useful to sort the raions by the number of transactions.
+
+```{r tot_transactions}
+tot_transactions <- mean_prices %>% 
+  group_by(sub_area) %>%
+  summarise(tot_n_transactions = sum(n_transactions)) %>%
+  arrange(desc(tot_n_transactions)) %>%
+  mutate(sub_area = forcats::fct_inorder(sub_area))
+mean_prices %<>% 
+  mutate(
+    sub_area = factor(sub_area, 
+                      levels = levels(tot_transactions$sub_area)
+    )
+  )
+```
+
+We can plot the prices by year and by raion, separating the different property types.
+
+```{r plot_mean_prices, eval=FALSE}
+p <- ggplot(
+  data = mean_prices, 
+  aes(x = year, y = mean_price_per_sqm, col = product_type)) + geom_line() +
+  facet_wrap(~ sub_area, scales = "free_y")
+ggsave(p, filename = "../plots/mean_prices_per_sqm.png",
+       width = 12, height = 10)
+```
+
+### Which raions see the most transactions?
+
+We can inspect which raions have the largest numbers of transactions per year for each product type.
+
+```{r, eval=FALSE}
+most_trans <- mean_prices %>%
+  group_by(year, product_type, sub_area) %>%
+  mutate(tot_trans = sum(n_transactions))
+p <- ggplot(
+  data = most_trans, 
+  aes(x = year, y = tot_trans, fill = product_type)
+  ) +
+  geom_bar(stat = "identity", position = "dodge") + 
+  facet_wrap(~ sub_area)
+ggsave(p, file = "../plots/bar_most_transactions.png",
+       width = 12, height = 10)
+```
+
+## Transforming the variables
+
+We can apply a Box Cox tranformation to the numeric variables in the essential dataset.
+
+```{r}
+essential_num <- as.matrix(
+  essential[map_lgl(essential, is.numeric)]
+)
+bc <- caret::preProcess(essential_num, method = "BoxCox")
+essential_num <- predict(bc, essential_num)
+tmp_essential <- essential
+tmp_essential[match(names(essential_num), tmp_essential)] <- essential_num
+tmp_essential$price <- y_train
+```
+
+We can now fit a linear model to check which variables clearly deviate for the global trend
+
+```{r}
+m <- lm(price ~ ., data = tmp_essential)
+par(mfrow = c(2, 2))
+plot(m)
+```
+
+The QQ plot clearly shows that we are very far from even a decent model.
+
+```{r}
+save(prices, essential, test,
+     file = "../output/03-essential_dataset.Rmd")
+```
+

@@ -1,0 +1,2228 @@
+---
+title: "The Sberbank Kaggle Competition"
+author: "Giovanni d'Ario"
+site: bookdown::bookdown_site
+documentclass: book
+output:
+  bookdown::gitbook: default
+  bookdown::pdf_book: default
+---
+
+# Preface {-}
+
+This document shows various attempts at analyzing the Sberbank dataset, from
+the Kaggle competition hosted in May-June 2017.
+
+
+<!--chapter:end:index.Rmd-->
+
+# Introduction
+
+The Sberbank Kaggle competition consists in predicting the price of houses in a
+given period of time (from 2015-07-01 to 2016-05-30). Predictors can be roughly
+categorized into apartment/building specific, raion (area or district)
+specific, population/demographic data, and macro-economic indicators. There are
+more than 290 predictors overall, many of which stronly correlated. One
+important characteristic of this dataset is the large number of missing values,
+that occurr in non-random patterns. For some predictors more than 40% of the
+values are missing, and imputation has little change of succeeding, since all
+the values are missing within the same time interval.
+
+<!--chapter:end:01-intro.Rmd-->
+
+# Data Exploration
+
+## Reading the data in
+
+Data can be separated in three main groups: training set, test set and
+macroeconomic indicators, from now one referred to as the "macro" set, for
+short.
+
+```{r, message=FALSE}
+library(magrittr)
+library(tidyverse)
+train <- readr::read_csv("../data/train.csv.gz")
+test <- readr::read_csv("../data/test.csv.gz")
+macro <- readr::read_csv("../data/macro.csv.zip")
+dim(train); dim(test); dim(macro)
+```
+
+All the timestamps appearing in the training and in the test set are present in the macro set. We can add a column to each set to identify it.
+
+```{r}
+train$dataset <- "training_set"
+test$dataset <- "test_set"
+```
+
+Only the training set contains the prices in the `price_doc` variable. We can extract it as combine the other datasets.
+
+```{r}
+prices <- train %>% select(id, timestamp, price_doc)
+train$price_doc <- NULL
+stopifnot(all.equal(colnames(train), colnames(test)))
+train_test <- rbind(train, test)
+dim(train_test)
+```
+
+## Data Cleaning
+
+We can use the `clean_dataset` function from the `utilities.R` script to clean-up the dataset. This will only remove some of the issues, but still some cleaning will be required.
+
+```{r data_cleaning}
+source("../R/utilities.R")
+cleaned_train_test <- clean_dataset(
+  dataset = train_test,
+  add_dummies = FALSE,
+  remove_sub_area = FALSE
+)
+rm(train_test)
+```
+
+The cleaned dataset contains `r ncol(cleaned_train_test)` columns. We can remove the numeric columns that contain highly correlated features. For this we separate the numeric and the text features.
+
+```{r find_corrleations}
+time_id <- cleaned_train_test %>% select(id, timestamp)
+cleaned_train_test %<>% select(-c(id, timestamp))
+numeric_vars <- cleaned_train_test %>% map_lgl(is.numeric)
+char_vars <- cleaned_train_test %>% map_lgl(is.character)
+numeric_dataset <- cleaned_train_test[numeric_vars]
+char_dataset <- cleaned_train_test[char_vars]
+tmp <- ncol(numeric_dataset) + ncol(char_dataset)
+stopifnot(tmp == ncol(cleaned_train_test))
+rm(char_vars, numeric_vars)
+```
+
+We use the Caret package to find the highly correlated variables. We need to remove some columns that prevent the calculation of the correlation matrix. We get rid of the variables that have too large a fraction of missing values
+
+```{r remove_numeric_nas}
+pna <- numeric_dataset %>%
+  map_dbl(~ mean(is.na(.x)))
+to_remove <- names(pna)[pna > .4]
+numeric_dataset %<>% select(-one_of(to_remove))
+```
+
+We can use Spearman's correlation, which should be less sensitive to extreme values. In principle, this should fit better with xgboost. In practice, it may not.
+
+```{r}
+library(caret)
+tmp <- as.matrix(numeric_dataset)
+cormat <- cor(tmp, method = "spearman", use = "complete")
+to_remove <- findCorrelation(cormat, names = TRUE)
+numeric_dataset %<>% select(-one_of(to_remove))
+rm(tmp, cormat)
+```
+
+This single operation has removed `r length(to_remove)` columns. We now need to take care of the character variables. For the time being we are retaining the `sub_area`. This variable has `r length(unique(char_dataset$sub_area))` unique entries, which makes it difficult to deal with. In any case we will keep it for further explorations later on.
+
+```{r}
+glimpse(char_dataset)
+```
+
+The dataset seems to be OK. We can have an idea of how many variables are binary.
+
+```{r}
+char_dataset %>% map_int(~length(unique(.x[!is.na(.x)])))
+```
+
+We can put together the numeric and character datasets again
+
+```{r}
+cleaned_train_test <- bind_cols(numeric_dataset, char_dataset)
+rm(numeric_dataset, char_dataset)
+```
+
+## The Macro economic dataset
+
+For some variables up to 70% of the values are missing
+
+```{r}
+pna <- macro %>% map_dbl(~mean(is.na(.x)))
+idx <- order(pna, decreasing = FALSE)
+VIM::aggr(macro[, idx])
+```
+
+We remove the variables that have more than 40% of missing values. This may still not be enough, but is a starting point.
+
+```{r}
+nms <- names(pna)[pna > .4]
+macro %<>% select(-one_of(nms))
+```
+
+
+Some variables are character while they should be numeric
+
+```{r}
+macro %>% map_lgl(is.character) %>% which()
+```
+
+The last one is OK, since it's the one we introduced. We remove the other one because it has very low variance.
+
+```{r}
+macro %<>% select(-child_on_acc_pre_school)
+```
+
+We can get rid of the highly correlated numeric variables as we did before
+
+```{r}
+macro_numeric <- macro[map_lgl(macro, is.numeric)]
+cormat <- cor(macro_numeric, method = "spearman", use = "complete")
+to_remove <- findCorrelation(cormat, names = TRUE)
+macro_numeric %<>% select(-one_of(to_remove))
+```
+
+Based on correlation, we have removed `r length(to_remove)` columns. We can now put together a new macro dataset.
+
+```{r}
+tmp <- macro %>% select(timestamp)
+cleaned_macro <- bind_cols(tmp, macro_numeric)
+rm(tmp, to_remove, cormat, macro_numeric)
+```
+
+We can finaly save the dataset containing the training, test and macro sets in an RData file.
+
+```{r}
+# Put back timestamp and id
+cleaned_train_test <- bind_cols(time_id, cleaned_train_test)
+cleaned_train_test_macro <- inner_join(
+  cleaned_train_test, cleaned_macro, by = "timestamp"
+)
+save(prices, cleaned_train_test_macro, file = "../output/02-data_exploration.RData")
+```
+
+
+<!--chapter:end:02-data_exploration.Rmd-->
+
+# The Essential Dataset
+
+We take on from where we left in the previous section, and further explore the variables selected so far.
+
+## Splitting the datasets
+
+```{r}
+library(magrittr)
+library(tidyverse)
+load("../output/02-data_exploration.RData")
+train <- filter(cleaned_train_test_macro, 
+                dataset == "training_set")
+test <- filter(cleaned_train_test_macro, 
+               dataset == "test_set")
+stopifnot(all.equal(prices$id, train$id))
+y_train <- log(1 + prices$price_doc)
+train$dataset <- test$dataset <- NULL
+```
+
+```{r}
+essential <- select(train, full_sq:indust_part, week, month, 
+                    state, material, product_type, rel_floor,
+                    sub_area, ecology)
+raion <- select(train, timestamp, contains('raion'))
+demographic <- select(train, timestamp, female_f:`7_14_male`, 
+                      full_dens:work_dens)
+macro <- select(train, timestamp, oil_urals:apartment_build) %>%
+  distinct()
+area_cols <-   setdiff(
+  names(train), c(names(essential), 
+                  names(raion), 
+                  names(demographic), 
+                  names(macro))
+)
+area <- select(train, timestamp, one_of(area_cols)) %>%
+  select(-c(id, timestamp))
+save(essential, raion, demographic, macro, area, y_train, prices,
+     file = "../output/essential_aera_raion_demo_macro.RData")
+```
+
+## The Essential Dataset
+
+We create a data frame containing the average price per square meter in the various raions, including the information on the product type, the year, and the number of transactions for that combination of year, product type and sub-area.
+
+```{r}
+prices %<>% mutate(year = lubridate::year(timestamp))
+df_essential <- essential
+df_essential$price <- y_train
+df_essential$year <- prices$year
+df_essential %<>% mutate(price_per_sqm = price / full_sq)
+
+mean_prices <- df_essential %>%
+  group_by(year, product_type, sub_area) %>% 
+  summarise(n_transactions = n(), 
+            mean_price_per_sqm = mean(price_per_sqm, na.rm = TRUE)) %>%
+  arrange(year, product_type, desc(mean_price_per_sqm))
+```
+
+It can be useful to sort the raions by the number of transactions.
+
+```{r tot_transactions}
+tot_transactions <- mean_prices %>% 
+  group_by(sub_area) %>%
+  summarise(tot_n_transactions = sum(n_transactions)) %>%
+  arrange(desc(tot_n_transactions)) %>%
+  mutate(sub_area = forcats::fct_inorder(sub_area))
+mean_prices %<>% 
+  mutate(
+    sub_area = factor(sub_area, 
+                      levels = levels(tot_transactions$sub_area)
+    )
+  )
+```
+
+We can plot the prices by year and by raion, separating the different property types.
+
+```{r plot_mean_prices, eval=FALSE}
+p <- ggplot(
+  data = mean_prices, 
+  aes(x = year, y = mean_price_per_sqm, col = product_type)) + geom_line() +
+  facet_wrap(~ sub_area, scales = "free_y")
+ggsave(p, filename = "../plots/mean_prices_per_sqm.png",
+       width = 12, height = 10)
+```
+
+### Which raions see the most transactions?
+
+We can inspect which raions have the largest numbers of transactions per year for each product type.
+
+```{r, eval=FALSE}
+most_trans <- mean_prices %>%
+  group_by(year, product_type, sub_area) %>%
+  mutate(tot_trans = sum(n_transactions))
+p <- ggplot(
+  data = most_trans, 
+  aes(x = year, y = tot_trans, fill = product_type)
+  ) +
+  geom_bar(stat = "identity", position = "dodge") + 
+  facet_wrap(~ sub_area)
+ggsave(p, file = "../plots/bar_most_transactions.png",
+       width = 12, height = 10)
+```
+
+## Transforming the variables
+
+We can apply a Box Cox tranformation to the numeric variables in the essential dataset.
+
+```{r}
+essential_num <- as.matrix(
+  essential[map_lgl(essential, is.numeric)]
+)
+bc <- caret::preProcess(essential_num, method = "BoxCox")
+essential_num <- predict(bc, essential_num)
+tmp_essential <- essential
+tmp_essential[match(names(essential_num), tmp_essential)] <- essential_num
+tmp_essential$price <- y_train
+```
+
+We can now fit a linear model to check which variables clearly deviate for the global trend
+
+```{r}
+m <- lm(price ~ ., data = tmp_essential)
+par(mfrow = c(2, 2))
+plot(m)
+```
+
+The QQ plot clearly shows that we are very far from even a decent model.
+
+```{r}
+save(prices, essential, test,
+     file = "../output/03-essential_dataset.Rmd")
+```
+
+
+<!--chapter:end:03-essential_dataset.Rmd-->
+
+# The Area Dataset
+
+```{r}
+library(magrittr)
+library(tidyverse)
+load("../output/essential_aera_raion_demo_macro.RData")
+```
+
+The `area` dataset is the largest, containing `r ncol(area)` columns. All the variables containing `count` in the names are, well, counts. The variables starting with `ID_` are actually categorical and not numeric. There are `r sum(grepl('^ID_', names(area)))` such columns. Intuitively, it seems more relevant that there is a bus/train/metro station nearby, rather than the actual number of the line. We drop these columns since they contain quite a lot of values (see below)
+
+```{r}
+area %>% select(starts_with("ID_")) %>% map(unique)
+area %<>% select(-starts_with("ID_"))
+```
+
+There are a few character columns. They seem to be mostly binary variables
+
+```{r}
+area_char <- area %>% map_lgl(is.character) %>% which()
+area_char
+```
+
+Let's verify that they are actually binary
+
+```{r}
+area %>% select(area_char) %>% map_int(~length(unique(.x)))
+```
+Yes, they are all binary. We convert them to dichotomous variables.
+
+```{r}
+foo <- function(x) {ifelse(x == 'yes', 1, 0)}
+area %<>% mutate(
+   culture_objects_top_25 = foo(culture_objects_top_25),
+   water_1line = foo(water_1line),
+   big_road1_1line = foo(big_road1_1line),
+   railroad_1line = foo(railroad_1line)
+)
+any(map_lgl(area, is.character))
+```
+
+## Selecting the area variables with XGBoost
+
+If we run an xgboost model on the `area` dataset, and try to predict the prices on the pseudo-test set shown below, we find that the best number of rounds is around 720. 
+```{r, eval=TRUE, cache=TRUE}
+library(xgboost)
+X <- as.matrix(area)
+y <- y_train
+
+params <- list(
+  eta = 0.1, 
+  gamma = 1,
+  max_depth = 5,
+  min_child_weight = 1,
+  subsample = 0.9,
+  colsample_bytree = 0.9,
+  objective = "reg:linear")
+
+dTr <- xgb.DMatrix(X, label = y)
+
+set.seed(123)
+cv <- xgb.cv(params = params, data = dTr, nrounds = 500, nfold = 5)
+tr <- xgb.train(params = params, data = dTr, 
+                nrounds = which.min(cv$evaluation_log$test_rmse_mean))
+imp <- xgb.importance(colnames(X), model = tr)
+xgb.plot.importance(imp)
+to_keep <- filter(imp, Importance > 0.01)
+area <- select(area, one_of(to_keep$Feature))
+```
+
+To start with, we can retain only the variables with an importance above 0.01. This has left `r ncol(area)` features in the area dataset.
+
+```{r}
+save(area, file = "../output/04-area_dataset.RData")
+```
+
+
+<!--chapter:end:04-area_dataset.Rmd-->
+
+# The Macro Dataset
+
+```{r}
+library(magrittr)
+library(tidyverse)
+load("../output/essential_aera_raion_demo_macro.RData")
+macro <- inner_join(prices, macro)
+```
+
+We remove the id variable and add some time-related variables, namely year, month and week.
+
+```{r}
+macro_timestamp <- macro$timestamp
+macro %<>% select(-id) %>%
+  mutate(year = lubridate::year(timestamp),
+         month = lubridate::month(timestamp),
+         week = lubridate::week(timestamp),
+         price = log(1 + price_doc)) %>%
+  select(-timestamp)
+```
+
+## XGBoost model
+
+```{r}
+library(xgboost)
+y <- macro$price
+X <- macro %>% select(-c(price_doc, price)) %>% as.matrix()
+
+params <- list(
+  eta = 0.1, 
+  gamma = 1,
+  max_depth = 5,
+  min_child_weight = 1,
+  subsample = 0.9,
+  colsample_bytree = 0.9,
+  objective = "reg:linear")
+
+dTr <- xgb.DMatrix(X, label = y)
+
+set.seed(123)
+cv <- xgb.cv(params = params, data = dTr, nrounds = 300, nfold = 5)
+tr <- xgb.train(
+  params = params, 
+  data = dTr, 
+  nrounds = which.min(cv$evaluation_log$test_rmse_mean)
+)
+imp <- xgb.importance(colnames(X), model = tr)
+xgb.plot.importance(imp)
+xgb_to_keep <- filter(imp, Importance > 0.01)
+xgb_to_keep <- xgb_to_keep$Feature
+```
+
+## Glmnet
+
+```{r}
+library(glmnet)
+library(caret)
+bc <- preProcess(X, method = "BoxCox")
+X <- predict(bc, X)
+idx <- complete.cases(X)
+X <- X[idx, ]
+y <- y[idx]
+cv <- cv.glmnet(X, y, type.measure = "mse")
+plot(cv)
+```
+
+It seems that there are just 10 variables or so that are somewhat relevant.
+
+```{r}
+fit <- glmnet(X, y, lambda = cv$lambda.min)
+tmp <- coef(fit)
+glm_to_keep <- rownames(tmp)[tmp[, 1] != 0][-1] # Intercept
+```
+
+### Final selection
+
+We keep the predictors selected by both methods
+
+```{r, eval=FALSE}
+to_keep <- unique(c(xgb_to_keep, glm_to_keep))
+macro %<>% select(one_of(to_keep))
+macro$timestamp <- macro_timestamp
+save(macro, file = "../output/05-macro_dataset.RData")
+```
+
+### Alternative Approach
+
+We select the variables recommended by Roberto Ruiz in [this kernel](https://www.kaggle.com/robertoruiz/dealing-with-multicollinearity/notebook/notebook) (look at the bottom of the post).
+
+```{r}
+vif_to_keep <- c(
+  "year",
+  "balance_trade",
+  "balance_trade_growth",
+  "eurrub",
+  "average_provision_of_build_contract",
+  "micex_rgbi_tr",
+  # "micex_cbi_tr",
+  "deposits_rate",
+  "mortgage_value",
+  "mortgage_rate",
+  "income_per_cap",
+  # "rent_price_4.room_bus",
+  # "museum_visitis_per_100_cap",
+  "apartment_build"
+)
+
+to_keep <- union(xgb_to_keep, vif_to_keep)
+macro %<>% select(one_of(to_keep))
+macro$timestamp <- macro_timestamp
+save(macro, file = "../output/05-macro_dataset.RData")
+```
+
+<!--chapter:end:05-macro_dataset.Rmd-->
+
+# The Raion Dataset
+
+We want to know whether the raion-specific information is constant for a given raion (maybe within one year).
+
+```{r}
+library(magrittr)
+library(tidyverse)
+load("../output/essential_aera_raion_demo_macro.RData")
+raion <- bind_cols(prices, raion)
+raion$year <- lubridate::year(raion$timestamp)
+raion$sub_area <- essential$sub_area
+raion$timestamp <- NULL
+```
+
+We can check whether there is one record for each combination of year and `sub_area` or if there are more.
+
+```{r}
+tmp <- select(raion, -id, -price_doc, -timestamp) %>%
+  arrange(sub_area, year) %>%
+  distinct()
+tmp %>% select(year, sub_area) %>% duplicated() %>% any()
+```
+
+The correspondence is one-to-one. It does not make sense to check the association of these variables with each single transaction, but rather to compare it with the average prices per year and per raion.
+
+```{r}
+tmp <- select(raion, -c(id, timestamp))
+tmp$full_sq <- essential$full_sq
+yearly_price_raion <- tmp %>% 
+  group_by(year, sub_area) %>%
+  mutate(mean_price_sqm = mean(price_doc / full_sq)) %>%
+  select(-c(price_doc, full_sq)) %>%
+  ungroup() %>%
+  distinct()
+```
+
+We can see whether there is any association between the mean log price per square meter and the raion parameters.
+
+### GLMNET model
+
+We start creating the dummy variables for the character columns.
+
+```{r}
+library(caret)
+y <- log(1 + yearly_price_raion$mean_price_sqm)
+yearly_price_raion$mean_price_sqm <- NULL
+tmp_char <- yearly_price_raion[map_lgl(
+  yearly_price_raion, is.character)]
+tmp_num <- yearly_price_raion[map_lgl(
+  yearly_price_raion, is.numeric)]
+tmp_char$sub_area <- NULL
+d <- dummyVars(~ ., tmp_char, fullRank = TRUE)
+dummies <- predict(d, tmp_char)
+```
+
+and we transform the numeric variables with the exception of the year
+
+```{r}
+year <- tmp_num$year
+X <- as.matrix(tmp_num)[, -match('year', colnames(tmp_num))]
+bc <- preProcess(X, method = "BoxCox")
+X <- predict(bc, X)
+X <- cbind(X, year, dummies)
+```
+
+We can now fit a GLMNET model, but we need to remove the missing values first.
+
+```{r glmnet_raion}
+library(glmnet)
+idx <- complete.cases(X) & complete.cases(y)
+X <- X[idx, ]
+y <- y[idx]
+set.seed(666)
+cv <- cv.glmnet(X, y)
+fit <- glmnet(X, y, lambda = cv$lambda.min)
+cf <- coef(fit)
+glm_to_keep <- rownames(cf)[cf[, 1] != 0][-1]
+```
+
+### XGBoost Model
+
+```{r, message=FALSE}
+library(xgboost)
+
+params <- list(
+  eta = 0.1, 
+  gamma = 1,
+  max_depth = 5,
+  min_child_weight = 1,
+  subsample = 0.9,
+  colsample_bytree = 0.9,
+  objective = "reg:linear")
+
+dTr <- xgb.DMatrix(X, label = y)
+
+set.seed(666)
+cv <- xgb.cv(params = params, data = dTr, nrounds = 300, nfold = 5)
+tr <- xgb.train(
+  params = params, 
+  data = dTr, 
+  nrounds = which.min(cv$evaluation_log$test_rmse_mean)
+)
+imp <- xgb.importance(colnames(X), model = tr)
+xgb.plot.importance(imp)
+xgb_to_keep <- filter(imp, Importance > 0.01)
+xgb_to_keep <- xgb_to_keep$Feature
+```
+
+As in the previous case, we retain the union of the variables
+
+```{r}
+to_keep <- union(glm_to_keep, xgb_to_keep)
+to_keep <- gsub("yes$", "", to_keep)
+stopifnot(all(to_keep %in% colnames(yearly_price_raion)))
+yearly_price_raion %<>% select(sub_area, one_of(to_keep))
+prices %<>% mutate(
+  year = lubridate::year(timestamp),
+  sub_area = raion$sub_area
+)
+raion <- inner_join(prices, yearly_price_raion,
+                            by = c("year", "sub_area"))
+save(raion, file = "../output/06-raion_dataset.Rmd")
+```
+
+
+<!--chapter:end:06-raion_dataset.Rmd-->
+
+# The Demographic Dataset
+
+We want to know whether the demographic information is constant for a given raion for a given year. We expect the demographic information to be raion and time specific.
+
+```{r}
+library(magrittr)
+library(tidyverse)
+load("../output/essential_aera_raion_demo_macro.RData")
+demographic <- bind_cols(prices[, -2], demographic)
+demographic$year <- lubridate::year(demographic$timestamp)
+demographic$sub_area <- essential$sub_area
+# demographic$timestamp <- NULL
+```
+
+We can check whether there is one record for each combination of year and `sub_area` or if there are more.
+
+```{r}
+tmp <- select(demographic, -c(id, timestamp, price_doc)) %>%
+  arrange(sub_area, year) %>%
+  distinct()
+tmp %>% select(year, sub_area) %>% duplicated() %>% any()
+```
+
+As for the raion, the correspondence is one-to-one. It does not make sense to check the association of these variables with each single transaction, but rather to compare it with the average prices per year and per raion.
+
+```{r}
+tmp <- select(demographic, -c(id, timestamp))
+tmp$full_sq <- essential$full_sq
+yearly_price_demo <- tmp %>% 
+  group_by(year, sub_area) %>%
+  mutate(mean_price_sqm = mean(price_doc / full_sq)) %>%
+  select(-c(price_doc, full_sq)) %>%
+  ungroup() %>%
+  distinct()
+```
+
+We can see whether there is any association between the mean log price per square meter and the raion parameters.
+
+### GLMNET model
+
+
+```{r}
+library(caret)
+y <- log(1 + yearly_price_demo$mean_price_sqm)
+X <- yearly_price_demo %>% select(-c(mean_price_sqm, sub_area))
+X <- as.matrix(X)
+idx <- match("year", colnames(X))
+bc <- preProcess(X[, -idx], method = "BoxCox")
+X[, -idx] <- predict(bc, X[, -idx])
+```
+
+We can now fit a GLMNET model, but we need to remove the missing values first.
+
+```{r glmnet_rion}
+library(glmnet)
+idx <- complete.cases(X) & complete.cases(y)
+X <- X[idx, ]
+y <- y[idx]
+set.seed(666)
+cv <- cv.glmnet(X, y)
+fit <- glmnet(X, y, lambda = cv$lambda.min)
+cf <- coef(fit)
+glm_to_keep <- rownames(cf)[cf[, 1] != 0][-1]
+```
+
+### XGBoost Model
+
+```{r, results=FALSE, message=FALSE}
+library(xgboost)
+
+params <- list(
+  eta = 0.1, 
+  gamma = 1,
+  max_depth = 5,
+  min_child_weight = 1,
+  subsample = 0.9,
+  colsample_bytree = 0.9,
+  objective = "reg:linear")
+
+dTr <- xgb.DMatrix(X, label = y)
+
+set.seed(666)
+cv <- xgb.cv(params = params, data = dTr, nrounds = 300, nfold = 5)
+tr <- xgb.train(
+  params = params, 
+  data = dTr, 
+  nrounds = which.min(cv$evaluation_log$test_rmse_mean)
+)
+imp <- xgb.importance(colnames(X), model = tr)
+xgb.plot.importance(imp)
+xgb_to_keep <- filter(imp, Importance > 0.01)
+xgb_to_keep <- xgb_to_keep$Feature
+```
+
+As in the previous case, we retain the union of the variables
+
+```{r}
+to_keep <- union(glm_to_keep, xgb_to_keep)
+to_keep <- gsub("yes$", "", to_keep)
+stopifnot(all(to_keep %in% colnames(yearly_price_demo)))
+yearly_price_demo %<>% select(sub_area, one_of(to_keep))
+prices %<>% mutate(
+  year = lubridate::year(timestamp),
+  sub_area = demographic$sub_area
+)
+demographic <- inner_join(prices, yearly_price_demo,
+                            by = c("year", "sub_area"))
+save(demographic, file = "../output/07-demographics_dataset.Rmd")
+```
+
+
+<!--chapter:end:07-demographics_dataset.Rmd-->
+
+# Final Dataset
+
+We load the datasets we have created so far and put together whatever has passed the filtering. There are still a number of operations to take care of:
+
+1. Creating the dummy variables.
+2. Box-Cox tranformation of the predictors.
+3. Imputation
+
+```{r}
+library(magrittr)
+library(tidyverse)
+load("../output/03-essential_dataset.Rmd")
+load("../output/04-area_dataset.RData")
+load("../output/05-macro_dataset.RData")
+load("../output/06-raion_dataset.Rmd")
+load("../output/07-demographics_dataset.Rmd")
+```
+
+We first make sure that each subset has the same number of rows. We then remove the columns that appear in each subset.
+
+```{r}
+stopifnot(all.equal(
+  nrow(essential),
+  nrow(area),
+  nrow(raion),
+  nrow(demographic),
+  nrow(macro),
+  nrow(prices) 
+))
+
+prices$sub_area <- essential$sub_area
+to_remove <- c('id', 'price_doc', 'year', 'timestamp', 'sub_area')
+raion %<>% select(-one_of(to_remove))
+demographic %<>% select(-one_of(to_remove))
+macro %<>% select(-c(year, timestamp))
+essential %<>% select(-sub_area)
+```
+
+We can now arrange all the datasets in one single tibble.
+
+```{r make_tibble}
+train_set <- bind_cols(
+  essential,
+  area,
+  raion,
+  demographic,
+  macro
+)
+train_set <- bind_cols(prices[, 1:2], train_set)
+if(any(duplicated(names(train_set))))
+  stop("Duplicated columns")
+stopifnot(all(names(train_set) %in% names(test)))
+```
+
+We can now align the training and the test sets
+
+```{r}
+test_set <- test[names(train_set)]
+rm(test)
+rm(essential, area, raion, demographic, macro)
+```
+
+### Transform variables
+
+```{r}
+source("../R/utilities.R")
+train_tmp <- add_dummies(train_set[, -c(1, 2)], as_matrix = FALSE)
+test_tmp <- add_dummies(test_set[, -c(1, 2)], as_matrix = FALSE)
+train_set <- bind_cols(train_set[, 1:2], train_tmp)
+test_set <- bind_cols(test_set[, 1:2], test_tmp)
+rm(train_tmp, test_tmp)
+cl_train <- map_chr(train_set, class)
+cl_test <- map_chr(test_set, class)
+stopifnot(all.equal(cl_train, cl_test))
+```
+
+The classes of all the columns match in the trianing set and in the test set. We save the training, prices and test sets as data frames.
+
+```{r}
+save(train_set, test_set, prices, 
+     file = "../output/08-final_dataset.RData")
+```
+
+
+<!--chapter:end:08-final_dataset.Rmd-->
+
+# Further modification to the training and test sets
+
+We start adding some time specific variables
+
+```{r}
+library(magrittr)
+library(tidyverse)
+load("../output/08-final_dataset.RData")
+train_set %<>% mutate(
+  year = lubridate::year(timestamp),
+  month = lubridate::month(timestamp)
+)
+test_set %<>% mutate(
+  year = lubridate::year(timestamp),
+  month = lubridate::month(timestamp)
+)
+```
+
+## A First Test Submission
+
+We create one single submission to have an idea of how far the training set and the test set are.
+
+```{r, cache=TRUE, results="hide"}
+library(xgboost)
+params <- list(
+  eta = 0.1, 
+  gamma = 1,
+  max_depth = 5,
+  min_child_weight = 1,
+  subsample = 0.9,
+  colsample_bytree = 0.9,
+  objective = "reg:linear"
+)
+tmp <- select(train_set, -c(id, timestamp))
+dTr <- xgb.DMatrix(as.matrix(tmp), 
+                   label = log(1 + prices$price_doc))
+dTe <- xgb.DMatrix(as.matrix(tmp))
+set.seed(123)
+cv <- xgb.cv(params = params, data = dTr, nrounds = 300, nfold = 5)
+min_rmse <- round(min(cv$evaluation_log$test_rmse_mean), 5)
+rmse_sd <- round(cv$evaluation_log$test_rmse_std[
+  which.min(cv$evaluation_log$test_rmse_mean)
+], 5)
+tr <- xgb.train(
+  params = params, 
+  data = dTr, 
+  nrounds = which.min(cv$evaluation_log$test_rmse_mean)
+)
+preds <- predict(object = tr, newdata = dTe)
+submission <- tibble(id = test_set$id, price_doc = exp(preds))
+readr::write_csv(submission, path = "../output/test_submission.csv")
+```
+
+This run has produced a CV RMSE +/- SD of `r min_rmse` +/- 
+`r rmse_sd`. In contrast, the submission produces an RMSE of 0.36390 on the public LB.
+
+## Possible Things to Try
+
+1. Remove the low-price transactions
+2. Remove the first year and use only the other ones to cross-validate.
+3. Try adversarial training.
+
+<!--chapter:end:09-further_modifications.Rmd-->
+
+# Adversarial Validation
+
+Most of the analysis below is inspired by [this post](https://www.kaggle.com/rareitmeyer/av-explained-and-exploited-for-better-prediction), which in turn refers to the following two links:
+1. [AV part 1](http://fastml.com/adversarial-validation-part-one/)
+2. [AV part 2](http://fastml.com/adversarial-validation-part-two/)
+
+## Creation of a validation set
+
+The idea is to predict whether some data come from the training or the test set. For this purpose we create a validation set containing a similar proportion of observations as the test set.
+
+```{r}
+library(caret)
+library(glmnet)
+library(magrittr)
+library(tidyverse)
+load("../output/08-final_dataset.RData")
+```
+
+We use the `week` field to create the various dataset. The training set has weeks in the range `r range(train_set$week)`, while for the test set the range is `r range(test_set$week)`. We therefore create an AV training set with weeks 1:152 and a validation set with weeks 153-202.
+
+```{r}
+y <- c(rep(0, nrow(train_set)), rep(1, nrow(test_set)))
+X <- bind_rows(train_set, test_set)
+to_remove <- c('id', 'timestamp', 'month', 'week')
+X %<>% select(-one_of(to_remove))
+```
+
+We now create a `av_training` set and a `av_test` set based on the `y` vector.
+
+```{r}
+idx <- createDataPartition(y = y, p = 0.75, list = FALSE)
+X_av_train <- X[idx, ]
+y_av_train <- y[idx]
+X_av_test <- X[-idx, ]
+y_av_test <- y[-idx]
+```
+
+## First approach: XGBoost
+
+```{r, results="hide"}
+library(xgboost)
+
+params <- list(
+  eta = 0.1, 
+  gamma = 1,
+  max_depth = 3,
+  min_child_weight = 1,
+  subsample = 0.9,
+  colsample_bytree = 0.9,
+  objective = "binary:logistic"
+)
+
+dTrain <- xgb.DMatrix(as.matrix(X_av_train), label = y_av_train)
+dTest <- xgb.DMatrix(as.matrix(X_av_test), label = y_av_test)
+
+cv <- xgb.cv(
+  params = params,
+  data = dTrain,
+  nfold = 10,
+  metrics = 'error',
+  nrounds = 5
+  )
+```
+
+We have zero error, which is a bit disturing. We can confirm this on the test set
+
+```{r}
+tr <- xgb.train(params = params, data = dTrain, nround = 10)
+y_pred <- as.numeric(predict(tr, dTest) > 0.5)
+caret::confusionMatrix(y_pred, reference = y_av_test)
+```
+
+Let's investigate which factors have such a big impact.
+
+```{r}
+importance <- xgb.importance(
+  feature_names = colnames(dTrain),
+  model = tr
+)
+head(importance, n = 10)
+```
+
+### Is there really an association between these prices and the price in the training set?
+
+```{r price_and_brent}
+sub_train <- inner_join(
+  prices, 
+  select(train_set, brent, micex_rgbi_tr, gdp_quart_growth, id)
+)
+sub_train %<>% mutate(price = log(1 + price_doc))
+p <- ggplot(sub_train, aes(x = brent, y = price)) +
+  geom_point(alpha = 0.1) + geom_smooth()
+tmp <- sub_train %>% 
+  filter(brent < 50) %>%
+  summarise(price_min_brent = median(price))
+p <- p + geom_hline(
+  data = tmp, 
+  aes(yintercept = price_min_brent), 
+  col = "red"
+)
+print(p)
+```
+
+There seems to be a weak association between price and Brent, with the prices going down as the Brent goes up. The red line indicates the median price when the brent is below 50, and is used as a reference to make the downward trend clearer. Let's see how the Brent changes between the `av_train` and the `av_test` sets.
+
+```{r brent_by_st}
+brent_time <- train_set %>% 
+  select(timestamp, brent) %>% 
+  bind_rows(select(test_set, timestamp, brent))
+brent_time %<>% mutate(
+  dataset = c(rep('train', nrow(train_set)),
+              rep('test', nrow(test_set)))
+)
+p <- ggplot(data = brent_time,
+            aes(x = timestamp, y = brent, col = dataset)
+) + geom_point(alpha = 0.05) + geom_smooth()
+print(p)
+```
+
+From the plot we can see that the Brent has a completely different distribution in the test set. This, however, seems to have an impact on prices. Let's Brent from our dataset and check further which variables make a big difference
+
+### Plotting the price through time in the training set
+
+```{r}
+p <- ggplot(
+  data = prices,
+  aes(x = timestamp, y = log(1 + price_doc))
+) + geom_point(alpha = 0.01) + geom_smooth()
+print(p)
+```
+
+The striped patterns at the bottom indicate prices that are exactly 1M, 2M and 3M.
+
+```{r}
+p <- p + geom_hline(
+  yintercept = c(log(c(1:3) * 1e06)), 
+  col = "steelblue", alpha = 0.6
+)
+print(p)
+```
+
+## Removing the macro-economic features
+
+It is to be expected that the macro-economic features will follow time-dependent patters. For this reason we should concentrate on the variables that should not have a time dependence. We start removing the macro-economic variables.
+
+```{r no_macro}
+X %<>% select(-c(eurrub:apartment_build))
+X_av_train <- X[idx, ]
+y_av_train <- y[idx]
+X_av_test <- X[-idx, ]
+y_av_test <- y[-idx]
+
+dTrain <- xgb.DMatrix(as.matrix(X_av_train), label = y_av_train)
+dTest <- xgb.DMatrix(as.matrix(X_av_test), label = y_av_test)
+
+cv <- xgb.cv(
+  params = params,
+  data = dTrain,
+  nfold = 10,
+  metrics = 'error',
+  nrounds = 5
+)
+
+nb_rounds <- which.min(cv$evaluation_log$test_error_mean)
+tr <- xgb.train(params = params, data = dTrain, nround = nb_rounds)
+y_pred <- as.numeric(predict(tr, dTest) > 0.5)
+caret::confusionMatrix(y_pred, reference = y_av_test)
+```
+Let's visualize the most important features:
+
+```{r}
+importance <- xgb.importance(
+  feature_names = colnames(dTrain),
+  model = tr
+)
+head(importance, n = 10)
+```
+```{r}
+xgb.plot.importance(importance, top_n = 20)
+```
+From the plot above it seems that there is a difference in the distribution of `state1` houses as well as the `num_room` variable.
+
+**TO DO** It would also be important to make sure that the composition of the most frequent raions doesn't change too much between the training set and the test set.
+
+```{r}
+tmp <- cbind(dataset = ifelse(y == 0, "train", "test"), X)
+round(
+  prop.table(
+    xtabs(~ state1 + dataset, data = tmp), margin = 2),
+  digits = 2)
+```
+We can clearly see that the fraction of `state1` houses is very different in the training and in the test set.
+
+Similarly for the number of rooms
+
+```{r}
+round(
+  prop.table(
+    xtabs(~ num_room + dataset, data = tmp), margin = 2),
+  digits = 2)
+```
+
+These differences don't seem to be enough to explain the difference in the results.
+
+## Simulating the effect of time
+
+Let's consider the case where we split the training set into  `time_train` and a `time_test` sets in order to see which quantities contribute to the increased RMSE.
+
+```{r}
+rm(brent_time, cv, dTest, dTrain, idx, importance, nb_rounds,
+   sub_train, tmp, to_remove, tr, X, X_av_test, X_av_train,
+   y_av_train, y_av_test, y_pred, y, p)
+```
+
+We create now a test set containing all the measurements from 2015.
+
+```{r}
+X <- train_set %>% mutate(
+  year = lubridate::year(timestamp)
+) %>% select(-c(id, timestamp))
+
+idx_train <- X$year < 2015
+idx_test <- X$year == 2015
+
+X$year <- NULL
+y <- log(1 + prices$price_doc)
+X_train <- X[idx_train, ]
+y_train <- y[idx_train]
+X_test <- X[idx_test, ]
+y_test <- y[idx_test]
+```
+
+We can now fit a model on the training set and plot the predicted vs. the actual values to see where the differences come from.
+
+```{r, results="hide"}
+params <- list(
+  eta = 0.2, 
+  gamma = 1,
+  max_depth = 5,
+  min_child_weight = 1,
+  subsample = 0.9,
+  colsample_bytree = 0.9,
+  objective = "reg:linear",
+  nthread = 4
+)
+
+dTrain <- xgb.DMatrix(as.matrix(X_train), label = y_train)
+dTest <- xgb.DMatrix(as.matrix(X_test), label = y_test)
+
+cv <- xgb.cv(
+  params = params,
+  data = dTrain,
+  nfold = 10,
+  metrics = 'rmse',
+  nrounds = 150
+)
+
+nb_rounds <- which.min(cv$evaluation_log$test_rmse_mean)
+tr <- xgb.train(params = params, data = dTrain, nround = nb_rounds)
+preds_train <- predict(tr, dTrain)
+preds_test <- predict(tr, dTest)
+```
+
+Let's inspect the plot for the training set.
+
+```{r}
+res_train <- tibble(y_train, preds_train)
+p_train <- ggplot(res_train, aes(x = y_train, y = preds_train))
+p_train <- p_train +  geom_point(alpha = 0.01) + 
+  geom_abline(slope = 1, intercept = 0, col = 'red') +
+  geom_smooth() +
+  geom_vline(xintercept = log(c(1:3) * 1e6), col = 'grey')
+print(p_train)
+```
+There are two important components: a cear issue with the "round price" transactions, and a downward trend in the plot (the predicted values are systematically lower than the actual one).
+
+Let's see what happens in the test set.
+
+```{r}
+res_test <- tibble(y_test, preds_test)
+p_test <- ggplot(res_test, aes(x = y_test, y = preds_test))
+p_test <- p_test +  geom_point(alpha = 0.05) + 
+  geom_abline(slope = 1, intercept = 0, col = 'red') +
+  geom_smooth() +
+  geom_vline(xintercept = log(c(1:3) * 1e6), col = 'grey')
+print(p_test)
+```
+
+## Exploring the low-price houses
+
+It is clear that the "round price" transactions have an unduly impact on our estimates. Is there any pattern that allows the identification of these transactions. As before, we can turn this into a classification problem.
+
+```{r}
+rm(cv, dTrain, dTest, idx_train, idx_test, nb_rounds, p_test,
+   p_train, preds_test, preds_train, res_test, res_train, tr,
+   X, X_test, X_train, y, y_train, y_test)
+
+prices %<>% mutate(
+  round_price = 1 - as.numeric(price_doc %in% (c(1:3) * 1e6)),
+  price_1m = price_doc == 1e06,
+  price_2m = price_doc == 2e06,
+  price_3m = price_doc == 3e06
+)
+```
+
+As before, we create a training and a test set to identify the variables that are most strongly associated with these transactions.
+
+```{r}
+y <- prices$round_price
+X <- train_set %>%
+  mutate(year = lubridate::year(timestamp),
+         month = lubridate::month(timestamp),
+         day = lubridate::day(timestamp)
+  ) %>% select(-id, -timestamp)
+```
+
+The dataset is extremely unbalanced. We sample randomly as many negatives as we have positives
+
+```{r}
+X_pos <- filter(X, y == 0) # These are the positives
+X_neg <- filter(X, y == 1) %>% sample_n(nrow(X_pos))
+X <- bind_rows(X_pos, X_neg)
+y <- c(rep(0, nrow(X_pos)), rep(1, nrow(X_neg)))
+idx <- sample(1:nrow(X))
+X <- X[idx, ]
+y <- y[idx]
+```
+
+We now create a data partition
+
+```{r}
+idx_train <- createDataPartition(y, p = .8, list = FALSE)
+X_train <- X[idx_train, ]
+y_train <- y[idx_train]
+X_test <- X[-idx_train, ]
+y_test <- y[-idx_train]
+```
+
+We run again an xgboost classifier and check which variables seem to be most strongly associated.
+
+```{r, results="hide"}
+params <- list(
+  eta = 0.1, 
+  gamma = 1,
+  max_depth = 4,
+  min_child_weight = 1,
+  subsample = 0.9,
+  colsample_bytree = 0.9,
+  nthread = 4,
+  objective = "binary:logistic"
+)
+
+dTrain <- xgb.DMatrix(as.matrix(X_train), label = y_train)
+dTest <- xgb.DMatrix(as.matrix(X_test), label = y_test)
+
+cv <- xgb.cv(
+  params = params,
+  data = dTrain,
+  nfold = 10,
+  metrics = 'error',
+  nrounds = 50
+)
+
+nb_rounds <- which.min(cv$evaluation_log$test_error_mean)
+tr <- xgb.train(params = params, data = dTrain, nround = nb_rounds)
+y_pred <- as.numeric(predict(tr, dTest) > 0.5)
+caret::confusionMatrix(y_pred, reference = y_test)
+```
+
+Let's see what are the most important features:
+
+```{r}
+importance <- xgb.importance(colnames(X_train), model = tr)
+xgb.plot.importance(importance, top_n = 20)
+```
+
+### Developing a sub-sampling strategy
+
+Let's take a closer look at the round prices. Our goal is to understand wheather the proportion of such prices is changing through time and, most importantly, to estimate what is the most likely proportion in the test set.
+
+```{r round_prices_through_time}
+n <- nrow(prices)
+
+round_prices_in_time <- prices %>%
+  mutate(month = lubridate::month(timestamp))
+
+yearly_prop_round_prices <- round_prices_in_time %>%
+  group_by(year) %>%
+  summarise(p_1m = sum(price_1m) / n(),
+            p_2m = sum(price_2m) / n(),
+            p_3m = sum(price_3m) / n()
+  ) %>% gather(key = group, value = percentage, p_1m:p_3m)
+
+p <- ggplot(
+  data = yearly_prop_round_prices,
+  aes(x = year, y = percentage, fill = group)) + 
+  geom_bar(stat = "identity", position = position_dodge()
+  )
+print(p)
+```
+
+In the plot above, it is important to note that 2011 and 2015 are not entirely present.
+
+```{r range_2015}
+prices %>% 
+  filter(year == 2015) %>% 
+  summarise(
+    min = min(timestamp),
+    max = max(timestamp)
+  )
+```
+
+Let's discard 2011 and look only at the first 6 months of each year.
+
+```{r}
+round_prices_in_time %<>% 
+  filter(year != 2011, month < 7)
+
+n <- nrow(round_prices_in_time)
+
+semi_yearly_prop_round_prices <- round_prices_in_time %>%
+  group_by(year) %>%
+  summarise(p_1m = sum(price_1m) / n(),
+            p_2m = sum(price_2m) / n(),
+            p_3m = sum(price_3m) / n()
+  ) %>% gather(key = group, value = percentage, p_1m:p_3m)
+
+p <- ggplot(
+  data = semi_yearly_prop_round_prices,
+  aes(x = year, y = percentage, fill = group)) + 
+  geom_bar(stat = "identity", position = position_dodge()
+  )
+print(p)
+```
+
+It's clear that 2011, and partly 2012 had a larger fraction of 1M and 2M transactions.
+
+<!--chapter:end:10-adversarial_validation.Rmd-->
+
+# Removing 2011
+
+In this chapter we assess the impact of removing all the data from 2011. This may be a bit too drastic, and neglects the fact that similar issues are present, at least partly, in 2012. We use the last year as a validation set
+
+```{r}
+library(magrittr)
+library(tidyverse)
+library(xgboost)
+load("../output/08-final_dataset.RData")
+```
+
+Let's remove all the entries from 2011 in the trainin set
+
+```{r}
+train_set %<>% filter(prices$year > 2011)
+```
+
+We first examine the range of dates in the test set.
+
+```{r}
+print(range(test_set$timestamp))
+print(diff(range(test_set$timestamp)))
+```
+
+The dataset contains 8 months of data. We create a validation set containing the last 4 months of the training set.
+
+```{r}
+print(max(train_set$timestamp))
+val_set <- train_set %>% filter(timestamp >= "2015-02-01")
+prices_val <- prices %>% filter(id %in% val_set$id)
+
+train_set %<>% filter(timestamp < "2015-02-01")
+prices_train <- prices %>% filter(id %in% train_set$id)
+
+print(diff(range(val_set$timestamp)))
+```
+
+We now create an xgboost model to assess how accurately we can predict the validation set, and how off we are in our predictions on the public leaderboard.
+
+```{r}
+X_tr <- train_set %>%
+  mutate(year = lubridate::year(timestamp)) %>%
+  select(-c(id, timestamp)) %>% as.matrix()
+X_val <- val_set %>% 
+  mutate(year = lubridate::year(timestamp)) %>%
+  select(-c(id, timestamp)) %>% as.matrix()
+X_test <- test_set %>%
+  mutate(year = lubridate::year(timestamp)) %>%
+  select(-c(id, timestamp)) %>% as.matrix()
+X_train <- rbind(X_tr, X_val)
+
+y_tr <- log(1 + prices_train$price_doc)
+y_val <- log(1 + prices_val$price_doc)
+y_train <- c(y_tr, y_val)
+
+dTr <- xgb.DMatrix(X_tr, label = y_tr)
+dVal <- xgb.DMatrix(X_val, label = y_val)
+dTrain <- xgb.DMatrix(X_train, label = y_train)
+dTe <- xgb.DMatrix(X_test)
+```
+
+We build a model based on a watchlist containing the validation set.
+
+```{r, results="hide"}
+watchlist <- list(eval = dVal, train = dTr)
+
+param <- list(
+  eta = 0.1,
+  nthread = 4,
+  objective = "reg:linear",
+  eval_metric = "rmse",
+  gamma = 1,
+  max_depth = 4,
+  min_child_weight = 1,
+  subsample = .8,
+  colsample_by_tree = .8
+)
+
+tr <- xgb.train(
+  params = param, 
+  data = dTr, 
+  nrounds = 300, 
+  watchlist = watchlist
+)
+```
+
+We obtain a not very impressive performance.
+
+```{r}
+nround <- which.min(tr$evaluation_log$eval_rmse)
+print(tr$evaluation_log[nround, ])
+```
+
+We can check where we are going wrong in the validation set.
+
+```{r}
+pred_val <- predict(tr, dVal)
+res_df <- tibble(y_val, pred_val)
+p <- ggplot(res_df, aes(x = y_val, y = pred_val)) +
+  geom_point(alpha = 0.1) + 
+  geom_abline(slope = 1, intercept = 0) +
+  geom_smooth()
+print(p)
+```
+
+Clearly we are still predicting too many "round priced" transactions. This is probably due to the influence of the 2012 observations.
+
+We now train the model on the full set and assess the performance
+
+```{r}
+full_tr <- xgb.train(params = param, data = dTrain, nrounds = nround)
+preds <- predict(full_tr, dTe)
+submission <- tibble(id = test_set$id, price_doc = exp(preds))
+write_csv(submission, path = "../output/submission_no_2011.csv")
+```
+
+<!--chapter:end:11-removing_2011.Rmd-->
+
+# Further analysis of the round-priced transactions
+
+```{r}
+library(magrittr)
+library(tidyverse)
+load("../output/08-final_dataset.RData")
+prices %<>% filter(
+  !(price_doc %in% c(1e06, 2e06, 3e06)),
+  price_doc > exp(14.3)
+)
+
+sub_train_set <- train_set %>% filter(id %in% prices$id)
+```
+
+## XGBoost model
+
+```{r}
+library(xgboost)
+val_set <- sub_train_set %>% filter(timestamp >= "2015-02-01")
+prices_val <- prices %>% filter(id %in% val_set$id)
+
+sub_train_set %<>% filter(timestamp < "2015-02-01")
+prices_train <- prices %>% filter(id %in% sub_train_set$id)
+
+X_tr <- sub_train_set %>%
+  mutate(year = lubridate::year(timestamp)) %>%
+  select(-c(id, timestamp)) %>% as.matrix()
+X_val <- val_set %>% 
+  mutate(year = lubridate::year(timestamp)) %>%
+  select(-c(id, timestamp)) %>% as.matrix()
+X_test <- test_set %>%
+  mutate(year = lubridate::year(timestamp)) %>%
+  select(-c(id, timestamp)) %>% as.matrix()
+X_train <- rbind(X_tr, X_val)
+
+y_tr <- log(1 + prices_train$price_doc)
+y_val <- log(1 + prices_val$price_doc)
+y_train <- c(y_tr, y_val)
+
+dTr <- xgb.DMatrix(X_tr, label = y_tr)
+dVal <- xgb.DMatrix(X_val, label = y_val)
+dTrain <- xgb.DMatrix(X_train, label = y_train)
+dTe <- xgb.DMatrix(X_test)
+```
+
+Model fit 
+
+```{r, results="hide"}
+watchlist <- list(eval = dVal, train = dTr)
+
+param <- list(
+  eta = 0.1,
+  nthread = 4,
+  objective = "reg:linear",
+  eval_metric = "rmse",
+  gamma = 1,
+  max_depth = 6,
+  min_child_weight = 1,
+  subsample = .7,
+  colsample_by_tree = .8
+)
+
+tr <- xgb.train(
+  params = param, 
+  data = dTr, 
+  nrounds = 1000, 
+  watchlist = watchlist
+)
+
+nround <- which.min(tr$evaluation_log$eval_rmse)
+
+pred_val <- predict(tr, dVal)
+res_df <- tibble(y_val, pred_val)
+p <- ggplot(res_df, aes(x = y_val, y = pred_val)) +
+  geom_point(alpha = 0.1) + 
+  geom_abline(slope = 1, intercept = 0) +
+  geom_smooth()
+print(p)
+```
+
+Let's create a submission
+
+```{r}
+full_tr <- xgb.train(params = param, data = dTrain, nrounds = nround)
+preds <- predict(full_tr, dTe)
+submission <- tibble(id = test_set$id, price_doc = exp(preds))
+write_csv(
+  submission, 
+  path = "../output/submission_no_extreme_values.csv"
+)
+```
+
+
+<!--chapter:end:12-further_analysis_round_prices.Rmd-->
+
+# Further analysis of the round-priced transactions
+
+We start adding the indicator variables for the 1M, 2M and 3M transactions. We want to understand whether there are raion-related patterns. For example, are this type of transactions more frequent in specific raions?
+
+```{r}
+library(magrittr)
+library(tidyverse)
+load("../output/08-final_dataset.RData")
+
+prices %<>% mutate(
+  round_price = as.numeric(price_doc %in% (c(1:3) * 1e6)),
+  price_1m = price_doc == 1e06,
+  price_2m = price_doc == 2e06,
+  price_3m = price_doc == 3e06
+)
+```
+
+I have checked whether the transactions with round prices take place always in the same raions, and it's not the case. I'm skipping this part of the code for brevity.
+
+## Relative frequency of the round-priced transactions
+
+```{r, rel_freq}
+round_prices <- prices %>%
+  group_by(year) %>%
+  summarise(
+    p_1m = sum(price_1m) / n(),
+    p_2m = sum(price_2m) / n(),
+    p_3m = sum(price_3m) / n()
+  ) %>%
+  gather(key = parameter, value = percentage, p_1m:p_3m)
+```
+
+Let's plot these results and see whether there's a pattern through time.
+
+```{r}
+p <- ggplot(
+  data = round_prices,
+  aes(x = year, y = percentage, fill = parameter)
+  ) +
+  geom_bar(stat = "identity", position = "dodge")
+print(p)
+```
+
+## Subsampling strategy
+
+We can, to be a bit conservative, take the average proportions for each type of round price from the last two years.
+
+```{r last_two_years}
+mean_14_16 <- round_prices %>% filter(year > 2013) %>%
+  group_by(parameter) %>%
+  summarise(mean_p = mean(percentage))
+print(mean_14_16)
+```
+
+We now want to subsample the whole training set such that the round-priced transactions are present in these proportions. We don't modify the fraction of 3M prices because the estimated proportion is higher than the actual one.
+
+```{r}
+N <- nrow(train_set)
+
+normal_prices <- filter(prices, round_price == 0)
+
+prices_1m <- filter(prices, price_doc == 1e06)
+prices_2m <- filter(prices, price_doc == 2e06)
+prices_3m <- filter(prices, price_doc == 3e06)
+
+sub_price_1m <- sample_n(prices_1m, round(N * mean_14_16$mean_p[1]))
+sub_price_2m <- sample_n(prices_2m, round(N * mean_14_16$mean_p[2]))
+# sub_price_1m <- sample_n(prices_3m, round(N * mean_14_16$mean_p[3]))
+```
+
+We now create a new training set containing these subsets
+
+```{r}
+prices <- bind_rows(
+  normal_prices,
+  sub_price_1m,
+  sub_price_2m,
+  prices_3m
+)
+
+sub_train_set <- train_set %>% filter(id %in% prices$id)
+```
+
+Let's verify that this is what we want
+
+```{r}
+prices %>%
+  summarise(
+    p_1m = sum(price_1m) / n(),
+    p_2m = sum(price_2m) / n(),
+    p_3m = sum(price_3m) / n()
+  ) 
+```
+
+We save the subsampled training set in a new RData file.
+
+```{r}
+sub_train_set %<>% arrange(timestamp)
+prices %<>% select(id:sub_area) %>% 
+  arrange(timestamp)
+```
+
+## XGBoost model
+
+```{r}
+library(xgboost)
+val_set <- sub_train_set %>% filter(timestamp >= "2015-02-01")
+prices_val <- prices %>% filter(id %in% val_set$id)
+
+sub_train_set %<>% filter(timestamp < "2015-02-01")
+prices_train <- prices %>% filter(id %in% sub_train_set$id)
+
+X_tr <- sub_train_set %>%
+  mutate(year = lubridate::year(timestamp)) %>%
+  select(-c(id, timestamp)) %>% as.matrix()
+X_val <- val_set %>% 
+  mutate(year = lubridate::year(timestamp)) %>%
+  select(-c(id, timestamp)) %>% as.matrix()
+X_test <- test_set %>%
+  mutate(year = lubridate::year(timestamp)) %>%
+  select(-c(id, timestamp)) %>% as.matrix()
+X_train <- rbind(X_tr, X_val)
+
+y_tr <- log(1 + prices_train$price_doc)
+y_val <- log(1 + prices_val$price_doc)
+y_train <- c(y_tr, y_val)
+
+dTr <- xgb.DMatrix(X_tr, label = y_tr)
+dVal <- xgb.DMatrix(X_val, label = y_val)
+dTrain <- xgb.DMatrix(X_train, label = y_train)
+dTe <- xgb.DMatrix(X_test)
+```
+
+Model fit 
+
+```{r, results="hide"}
+watchlist <- list(eval = dVal, train = dTr)
+
+param <- list(
+  eta = 0.1,
+  nthread = 4,
+  objective = "reg:linear",
+  eval_metric = "rmse",
+  gamma = 1,
+  max_depth = 4,
+  min_child_weight = 1,
+  subsample = .8,
+  colsample_by_tree = .8
+)
+
+tr <- xgb.train(
+  params = param, 
+  data = dTr, 
+  nrounds = 300, 
+  watchlist = watchlist
+)
+
+```
+
+```{r}
+pred_val <- predict(tr, dVal)
+res_df <- tibble(y_val, pred_val)
+p <- ggplot(res_df, aes(x = y_val, y = pred_val)) +
+  geom_point(alpha = 0.1) + 
+  geom_abline(slope = 1, intercept = 0) +
+  geom_smooth()
+print(p)
+```
+
+
+<!--chapter:end:further_analysis_round_prices.Rmd-->
+
+---
+title: "AV Explained and Exploited for Better Prediction"
+author: "rareitmeyer"
+date: "May 16, 2017"
+output: html_document
+---
+
+
+# Summary
+
+This script explains adversarial validation, shows important
+differences between the Kaggle-supplied test and training data,
+and gives you the test row IDs that can improve your prediction
+accuracy. Along the way, it illustrates using XGBoost for 
+classification, how to spot the most important features in a XGBoost
+model, and permutation testing.
+
+
+# Validation Background
+
+When building a model for a Kaggle contest, it's easy to check
+accuracy by modeling against the entire 'train' dataset provided,
+then predicting on all the provided 'test' and using the leaderboard
+to see which model is best.
+
+But that only works for less than five good ideas per day,
+and isn't easy to add into a programmatic optimization routine.
+
+The preferred approach is to break the supplied training data into
+two or three subsets. Names vary, but basically:
+
+* train, used to train a model, ~60% of the overall train data
+
+* test, used to pick hyperparameters, ~20% of the overall train data
+
+* validation, used to chose between models, ~20% of the overall train data
+
+By picking models based on the validation set, we can do all the
+model-picking work locally without any five-per-day limit. (Beware we
+will eventually start overfitting the validation set, but it happens
+indirectly.)
+
+
+## But what happens if my validation set isn't like the Kaggle 'test' set?
+
+Using a local validation set is great... unless it isn't. If the data
+set we are using to validate against "is not like" the data set Kaggle
+is using to score our entry, model-picking will go awry.
+
+
+## Adversarial validation
+
+Enter "Adversarial Validation." Obligatory links: 
+
+* [http://fastml.com/adversarial-validation-part-one/]
+* [http://fastml.com/adversarial-validation-part-two/]
+
+Adversarial validation is a way to check to see if the validation set
+(or more broadly, the overall training data) is like the submission test
+data.
+
+This is _good_ in that it lets us know if using a randomly-picked
+test or validation data set for model picking will be helpful or 
+misleading.
+
+But it's _great_ because it provides a way to make new
+test / validation sets that should be like the submission test data,
+enabling us to use our test / validation results with confidence.
+
+
+## Setup
+
+Get started by loading libraries, defining some useful functions, 
+loading the data and fixing data types. 
+
+(Have echo=FALSE to suppress this as it's fairly boring, but 
+look at the code if interested.)
+
+
+```{r setup, echo=FALSE, include=FALSE}
+library(knitr)
+library(xgboost)
+library(caret)
+library(ggplot2)
+library(vcd)
+
+#knitr::opts_chunk$set(echo = FALSE)
+
+input_filename <- function(name, dir=input_dir) {
+    file.path(input_dir, name)
+}
+
+sans_cols <- function(data, cols)
+{
+    return (data[,setdiff(names(data),cols)])
+}
+
+to_X <- function(data, label=NULL, skipcols=c()) {
+    stopifnot(sum(is.na(data))==0)
+    mm <- model.matrix(~., data=sans_cols(data, skipcols))
+    if (is.null(label)) {
+      return (list(X=xgboost::xgb.DMatrix(mm), names=dimnames(mm)[[2]]))
+    } else {
+      return (list(X=xgboost::xgb.DMatrix(mm, label=label), names=dimnames(mm)[[2]]))
+    }
+}
+
+fix_col_types <- function(data, newtype, cols, ...)
+{
+    for (col in cols) {
+        if (!(col %in% names(data))) {
+            stop(sprintf("column %s is not present in the data", col))
+        }
+        if (newtype == 'character') {
+            data[,col] <- as.character(data[,col])
+        } else if (newtype == 'Date') {
+            data[,col] <- as.Date(as.character(data[,col]), ...)
+        } else if (newtype == 'factor') {
+            data[,col] <- factor(data[,col])
+        } else if (newtype == 'integer') {
+            data[,col] <- as.integer(as.character(data[,col]))
+        } else if (newtype == 'numeric') {
+            data[,col] <- as.numeric(as.character(data[,col]))
+        } else if (newtype == 'boolean') {
+            data[,col] <- ifelse(tolower(as.character(data[,col])) %in% c('1', 'true', 't', 'yes', 'y'), 1, 0)
+        } else {
+            stop(sprintf("unrecognized type %s", newtype))
+        }
+    }
+    return (data)
+}
+
+# a very simple NA-handling routine
+simple_imputer <- function(data)
+{
+    for (col in names(data)) {
+        if (any(is.na(data[,col]))) {
+            idx <- which(is.na(data[,col]))
+            if (is.character(data[,col])) {
+                data[idx,col] <- '<unknown>'
+            } else if (is.factor(data[,col])) {
+                tmp <- as.character(data[,col])
+                tmp[idx] <- '<unknown>'
+                data[,col] <- factor(tmp)
+            } else if (is.numeric(data[,col])) {
+                data[,sprintf('%s_isna', col)] <- is.na(data[,col])
+                data[idx,col] <- median(data[,col], na.rm=TRUE)
+            } else {
+                stop(sprintf("cannot impute column %s: unrecognized type %s", col, class(data[,col])))
+            }
+        }
+    }
+    return (data)
+}
+    
+input_dir = '../input'
+response_col <- 'price_doc'
+
+# Load all of the test and train data into one data frame so it's
+# easier to fix types.
+overall_data <- rbind(read.csv(input_filename('train.csv')),
+                      cbind(read.csv(input_filename('test.csv')), price_doc=NA))
+
+# Start fixing types.
+overall_data <- fix_col_types(overall_data, 'Date',
+                              'timestamp')
+overall_data <- fix_col_types(overall_data, 'numeric',
+                              c('full_sq', 'life_sq', 'kitch_sq',
+                                'area_m',
+                                'raion_popul'))
+overall_data <- fix_col_types(overall_data, 'integer',
+                              c('floor', 'max_floor',
+                                'build_year',
+                                'state',
+                                'num_room'))
+overall_data <- fix_col_types(overall_data, 'factor',
+                              c('material',
+                                'state',
+                                'product_type',
+                                'sub_area',
+                                'ID_metro',
+                                'ID_railroad_station_walk',
+                                'ID_railroad_station_avto',
+                                'ID_big_road1',
+                                'ID_big_road2',
+                                'ID_railroad_terminal',
+                                'ID_bus_terminal'))
+overall_data <- fix_col_types(overall_data, 'boolean',
+                              c('culture_objects_top_25',
+                                'thermal_power_plant_raion',
+                                'incineration_raion',
+                                'oil_chemistry_raion',
+                                'radiation_raion',
+                                'railroad_terminal_raion',
+                                'big_market_raion',
+                                'nuclear_reactor_raion',
+                                'detention_facility_raion',
+                                'water_1line',
+                                'big_road1_1line',
+                                'railroad_1line'))
+
+# remove NAs with a simple imputation scheme.
+overall_data <- cbind(simple_imputer(sans_cols(overall_data, response_col)),
+                      price_doc=overall_data[,response_col])
+
+# Also load the macro data. Won't use it much, so don't
+# spend a lot of time on it.
+macro <- read.csv(input_filename('macro.csv'))
+macro <- fix_col_types(macro, 'Date',
+                              'timestamp')
+```
+
+
+## In adversarial validation, the response is test/train, not price.
+
+The big idea is that we can compare whether or not the supplied 
+training and submission test data are "the same" by fitting a 
+powerful model try to predict whether a given point came from 
+train or test.
+
+If the model can't do better than a random guess, then the two 
+data sets are essentially identical. (Or our model was poor.)
+
+So for adversarial validation, the goal isn't to predict the response...
+it's to predict whether or not the price is known. To that end, replace
+the response with a 0/1 train/test indicator.
+
+```{r}
+overall_data[,response_col] <- as.numeric(is.na(overall_data[,response_col]))
+```
+
+
+## No timestamp or macroeconomic features
+
+Thinking ahead to avoid doing useless work, and keep this 
+presentation shorter, we're not going to use the timestamp 
+or macroecomic features.
+
+If we keep the timestamp and macroeconomic indicators, we'd 
+have complete separation, because all of the train data is 
+2015-06-30 or earlier and all test data is 2015-07-01 or later. 
+The timestamp is a direct giveaway.
+
+Other macroeconomic columns like cpi or deposits value or 
+fixed basket are fairly unique to the before / after 2015-06-30 
+cutoff and are also giveaways.
+
+```{r}
+ggplot2::qplot(timestamp, price_doc, data=overall_data)
+
+ggplot2::qplot(cpi, price_doc, data=merge(overall_data, macro, by='timestamp'))
+
+ggplot2::qplot(deposits_value, price_doc, data=merge(overall_data, macro, by='timestamp'))
+
+ggplot2::qplot(fixed_basket, price_doc, data=merge(overall_data, macro, by='timestamp'))
+```
+
+
+## Predictor columns
+
+The predictor columns are the ones we'll model on. As above, omit 
+the response column, the timestamp, and the ID since that is another
+giveaway. If we'd merged in macroeconomic columns, we'd omit those too.
+
+But take all the other columns.
+
+```{r}
+predictor_cols <- setdiff(names(overall_data), c(response_col,'timestamp','id'))
+```
+
+```{r, echo=FALSE}
+# If you have preprocessed a bunch of data together with macroeconomics...
+# load and get rid of date-centric macroeconomic columns
+if (FALSE) {
+    load(file='preprocessed.Rdata')
+    overall_data <- do.call(rbind, preprocessed)
+    overall_data[,response_col] <- as.numeric(is.na(data[,response_col]))
+    house_cols <- names(read.csv(input_filename('test.csv')))
+    house_cols <- intersect(names(data), c(house_cols, paste(house_cols, '_isna', sep='')))
+    # only look at predictor cols in the house-specific data
+    predictor_cols <- intersect(all_predictor_cols, house_cols)
+    # and drop timestamp and ID
+    predictor_cols <- setdiff(predictor_cols, c(response_col, 'timestamp', 'id'))
+}
+```
+
+
+Now build random splits for train / test / validation sets, per 
+typical practice typically outside of adversarial validation. We'll
+be able to see how well those are predicted by the upcoming model
+as a check.
+
+Make XGBoost matricies, too. (Here "to X" is utility function skipped
+over above.)
+
+```{r}
+# partition repeatably by setting a seed to contest end-date as an integer.
+set.seed(20170529)
+
+train_idx <- caret::createDataPartition(overall_data[1:nrow(overall_data),response_col], p=0.6, list=FALSE)
+non_train <- overall_data[setdiff(1:nrow(overall_data), train_idx),]
+train <- overall_data[train_idx,]
+validation_idx <- caret::createDataPartition(non_train[,response_col], p=0.5, list=FALSE)
+validation <- non_train[validation_idx,]
+test <- non_train[-c(validation_idx),]
+
+X_train <- to_X(train[,predictor_cols], label=train[,response_col])
+X_test <- to_X(test[,predictor_cols], label=test[,response_col])
+X_validation <- to_X(validation[,predictor_cols], label=validation[,response_col])
+```
+
+
+Make a model with XGBoost. Note that this is a classification 
+problem, not a regression problem, so the objective is 
+binary:logistic and the eval metric is logloss. (Don't accidentally 
+copy-paste linear regression code when doing adversarial validation!)
+
+```{r}
+param <- list(objective="binary:logistic",
+              eval_metric = "logloss",
+              eta = .02,
+              gamma = 1,
+              max_depth = 4,
+              min_child_weight = 1,
+              subsample = .7,
+              colsample_bytree = .5
+)
+rounds = 300
+xgb_model <- xgb.train(data = X_train$X,
+                       params = param,
+                       watchlist = list(train = X_train$X),
+                       nrounds = rounds,
+                       verbose = 1,
+                       print.every.n = 25
+)
+```
+
+# Predictions
+
+So, check the predictions for our in-sample (train) data set
+and test / validation data sets. Are the test and validation data sets
+roughly in line with random guessing, which would mean the Kaggle 
+submission test data is "the same as" the overall training data?
+
+Compare f1 scores from the predictor and random guessing with same 
+proportion of train/test points. The latter is easily obtained by
+permuting. 
+
+
+```{r}
+library(ModelMetrics, quiet=TRUE)
+score_fn <- function(actual, predicted)
+{
+  return (ModelMetrics::f1Score(actual, predicted))
+}
+train_preds <- predict(xgb_model, X_train$X)
+print(sprintf('train score: %f', score_fn(train[,response_col],train_preds)))
+train_random_guess <- sample(train[,response_col])
+print(sprintf('train random guess score: %f', score_fn(train[,response_col],train_random_guess)))
+
+test_preds <- predict(xgb_model, X_test$X)
+print(sprintf('test score: %f', score_fn(test[,response_col],test_preds)))
+test_random_guess <- sample(test[,response_col])
+print(sprintf('test random guess score: %f', score_fn(test[,response_col],test_random_guess)))
+
+valid_preds <- predict(xgb_model, X_validation$X)
+print(sprintf('validation score: %f', score_fn(validation[,response_col],valid_preds)))
+valid_random_guess <- sample(validation[,response_col])
+print(sprintf('test random guess score: %f', score_fn(validation[,response_col],valid_random_guess)))
+```
+
+
+## Feature Importances
+
+OK, the model did find a discrepancy between the test and train sets,
+even after excluding obvious columns like id, timestamp, and any
+macroeconomic columns that would proxy for timestamp.
+
+We can see what it found by looking at the top feature importances. 
+
+In XGBoost, the 'Gain' is the most important number, bigger meaning 
+more important.
+
+```{r}
+# importances are ordered by Gain, biggest gain (most important) first
+importances <- xgb.importance(feature_names=X_train$names, model=xgb_model)
+head(importances,10)
+xgb.plot.importance(importances[1:10,])
+```
+
+Looks like kitchen square meters and NA for max floors are pretty different
+between the overall train data and the submission test data. 
+
+The submission test data (price_doc==1 here) appears to have 
+proportionally fewer ~2m^2 kitchens, for example. 
+
+```{r}
+ggplot2::ggplot(aes(x=kitch_sq, y=price_doc), data=overall_data)+geom_jitter(width=0.4, alpha=0.1)+scale_x_log10()
+```
+
+And if a record has max_floor as NA, it's always a train record 
+and not a submission test record.
+
+```{r}
+vcd::mosaic(xtabs(~max_floor_isna + price_doc, data=overall_data))
+```
+
+It's certainly possible to records with the number of rooms missing,
+or the build year, but it's not really needed.
+
+
+## Make new train / test / validation sets the easy way
+
+While we could make a series of graphs like the above and then
+try to use them to pick data that is suitable for using as a
+test / validation set, there is a better way.
+
+We'll use the model we built to predict how "test"-like each
+record of the overall training data is. Sort on the prediction
+column, and the top N rows are our top-N test like records!
+
+So instead of partioning the provided training data randomly
+into train / test / validation, use the top portion of this
+table to grab your test and validation, and the bottom portion
+as your training, to improve the accuracy of your local model
+optimization.
+
+```{r}
+overall_train <- subset(overall_data, price_doc == 0)
+X_overall_train <- to_X(overall_train[,predictor_cols])
+overall_train_preds <- predict(xgb_model, X_overall_train$X)
+overall_train_ids_by_testprob <- data.frame(id=overall_train$id, testprob=overall_train_preds)
+overall_train_ids_by_testprob <- overall_train_ids_by_testprob[order(overall_train_ids_by_testprob$testprob, decreasing=TRUE),]
+
+save(overall_train_ids_by_testprob, file='overall_train_ids_by_testprob.Rdata')
+write.csv(overall_train_ids_by_testprob, file='overall_train_ids_by_testprob.csv', row.names=FALSE)
+```
+
+
+## Final thoughts.
+
+Good luck! I hope this helps you improve your scores.
+
+And if you can spare this an up-vote...
+
+
+## Postscript 2015-05-19
+
+Happycube asked if I'd tried omitting all the
+pre-2015 data, on grounds the early data was more ID-able than
+the later.
+
+That seemed worth a graph.
+
+Below is a EDCF plot showing the (cumulative) proportion of data
+points for each value of test probability.
+
+```{r}
+train <- read.csv(input_filename('train.csv'))
+train$timestamp <- as.Date(train$timestamp)
+train$year <- lubridate::year(train$timestamp)
+testprob_by_year <- merge(train[,c('id','year')], overall_train_ids_by_testprob[,c('id','testprob')])
+
+testprob_by_year_ecdf <- do.call(
+    rbind, lapply(
+        with(testprob_by_year, min(year):max(year)), function(y) {
+            s <- subset(testprob_by_year, year == y)
+            ecdf_fn <- ecdf(s$testprob)
+            s$ecdf <- ecdf_fn(s$testprob)
+            s$year <- ordered(s$year)
+            return (s)
+        }))
+ggplot(aes(x=testprob, y=ecdf, group=year), data=testprob_by_year_ecdf)+geom_line(aes(color=year))+scale_color_manual(values=c('red', 'orange', 'yellow', 'green', 'blue'))
+
+```
+
+
+The vertical lines for years 2011 and 2012 show that all of the data
+from those years have ~0% probability of being test rows. About 50%
+of the data from 2013 is similar, but a small proportion of it looks
+like test data. 2014 is better and 2015 is best.
+
+My take on this is that discarding 2011 and 2012 is sensible, but I'd
+keep 2014. 2013 is a toss up, as keeping gives 50% more data to train
+on, but the data isn't especially relevant to the submission test set.
+
+Thanks, happycube!
+
+
+<!--chapter:end:script.Rmd-->
+

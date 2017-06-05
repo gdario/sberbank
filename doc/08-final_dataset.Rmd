@@ -1,0 +1,83 @@
+# Final Dataset
+
+We load the datasets we have created so far and put together whatever has passed the filtering. There are still a number of operations to take care of:
+
+1. Creating the dummy variables.
+2. Box-Cox tranformation of the predictors.
+3. Imputation
+
+```{r}
+library(magrittr)
+library(tidyverse)
+load("../output/03-essential_dataset.Rmd")
+load("../output/04-area_dataset.RData")
+load("../output/05-macro_dataset.RData")
+load("../output/06-raion_dataset.Rmd")
+load("../output/07-demographics_dataset.Rmd")
+```
+
+We first make sure that each subset has the same number of rows. We then remove the columns that appear in each subset.
+
+```{r}
+stopifnot(all.equal(
+  nrow(essential),
+  nrow(area),
+  nrow(raion),
+  nrow(demographic),
+  nrow(macro),
+  nrow(prices) 
+))
+
+prices$sub_area <- essential$sub_area
+to_remove <- c('id', 'price_doc', 'year', 'timestamp', 'sub_area')
+raion %<>% select(-one_of(to_remove))
+demographic %<>% select(-one_of(to_remove))
+macro %<>% select(-c(year, timestamp))
+essential %<>% select(-sub_area)
+```
+
+We can now arrange all the datasets in one single tibble.
+
+```{r make_tibble}
+train_set <- bind_cols(
+  essential,
+  area,
+  raion,
+  demographic,
+  macro
+)
+train_set <- bind_cols(prices[, 1:2], train_set)
+if(any(duplicated(names(train_set))))
+  stop("Duplicated columns")
+stopifnot(all(names(train_set) %in% names(test)))
+```
+
+We can now align the training and the test sets
+
+```{r}
+test_set <- test[names(train_set)]
+rm(test)
+rm(essential, area, raion, demographic, macro)
+```
+
+### Transform variables
+
+```{r}
+source("../R/utilities.R")
+train_tmp <- add_dummies(train_set[, -c(1, 2)], as_matrix = FALSE)
+test_tmp <- add_dummies(test_set[, -c(1, 2)], as_matrix = FALSE)
+train_set <- bind_cols(train_set[, 1:2], train_tmp)
+test_set <- bind_cols(test_set[, 1:2], test_tmp)
+rm(train_tmp, test_tmp)
+cl_train <- map_chr(train_set, class)
+cl_test <- map_chr(test_set, class)
+stopifnot(all.equal(cl_train, cl_test))
+```
+
+The classes of all the columns match in the trianing set and in the test set. We save the training, prices and test sets as data frames.
+
+```{r}
+save(train_set, test_set, prices, 
+     file = "../output/08-final_dataset.RData")
+```
+

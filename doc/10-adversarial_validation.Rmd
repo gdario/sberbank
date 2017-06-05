@@ -1,0 +1,436 @@
+# Adversarial Validation
+
+Most of the analysis below is inspired by [this post](https://www.kaggle.com/rareitmeyer/av-explained-and-exploited-for-better-prediction), which in turn refers to the following two links:
+1. [AV part 1](http://fastml.com/adversarial-validation-part-one/)
+2. [AV part 2](http://fastml.com/adversarial-validation-part-two/)
+
+## Creation of a validation set
+
+The idea is to predict whether some data come from the training or the test set. For this purpose we create a validation set containing a similar proportion of observations as the test set.
+
+```{r}
+library(caret)
+library(glmnet)
+library(magrittr)
+library(tidyverse)
+load("../output/08-final_dataset.RData")
+```
+
+We use the `week` field to create the various dataset. The training set has weeks in the range `r range(train_set$week)`, while for the test set the range is `r range(test_set$week)`. We therefore create an AV training set with weeks 1:152 and a validation set with weeks 153-202.
+
+```{r}
+y <- c(rep(0, nrow(train_set)), rep(1, nrow(test_set)))
+X <- bind_rows(train_set, test_set)
+to_remove <- c('id', 'timestamp', 'month', 'week')
+X %<>% select(-one_of(to_remove))
+```
+
+We now create a `av_training` set and a `av_test` set based on the `y` vector.
+
+```{r}
+idx <- createDataPartition(y = y, p = 0.75, list = FALSE)
+X_av_train <- X[idx, ]
+y_av_train <- y[idx]
+X_av_test <- X[-idx, ]
+y_av_test <- y[-idx]
+```
+
+## First approach: XGBoost
+
+```{r, results="hide"}
+library(xgboost)
+
+params <- list(
+  eta = 0.1, 
+  gamma = 1,
+  max_depth = 3,
+  min_child_weight = 1,
+  subsample = 0.9,
+  colsample_bytree = 0.9,
+  objective = "binary:logistic"
+)
+
+dTrain <- xgb.DMatrix(as.matrix(X_av_train), label = y_av_train)
+dTest <- xgb.DMatrix(as.matrix(X_av_test), label = y_av_test)
+
+cv <- xgb.cv(
+  params = params,
+  data = dTrain,
+  nfold = 10,
+  metrics = 'error',
+  nrounds = 5
+  )
+```
+
+We have zero error, which is a bit disturing. We can confirm this on the test set
+
+```{r}
+tr <- xgb.train(params = params, data = dTrain, nround = 10)
+y_pred <- as.numeric(predict(tr, dTest) > 0.5)
+caret::confusionMatrix(y_pred, reference = y_av_test)
+```
+
+Let's investigate which factors have such a big impact.
+
+```{r}
+importance <- xgb.importance(
+  feature_names = colnames(dTrain),
+  model = tr
+)
+head(importance, n = 10)
+```
+
+### Is there really an association between these prices and the price in the training set?
+
+```{r price_and_brent}
+sub_train <- inner_join(
+  prices, 
+  select(train_set, brent, micex_rgbi_tr, gdp_quart_growth, id)
+)
+sub_train %<>% mutate(price = log(1 + price_doc))
+p <- ggplot(sub_train, aes(x = brent, y = price)) +
+  geom_point(alpha = 0.1) + geom_smooth()
+tmp <- sub_train %>% 
+  filter(brent < 50) %>%
+  summarise(price_min_brent = median(price))
+p <- p + geom_hline(
+  data = tmp, 
+  aes(yintercept = price_min_brent), 
+  col = "red"
+)
+print(p)
+```
+
+There seems to be a weak association between price and Brent, with the prices going down as the Brent goes up. The red line indicates the median price when the brent is below 50, and is used as a reference to make the downward trend clearer. Let's see how the Brent changes between the `av_train` and the `av_test` sets.
+
+```{r brent_by_st}
+brent_time <- train_set %>% 
+  select(timestamp, brent) %>% 
+  bind_rows(select(test_set, timestamp, brent))
+brent_time %<>% mutate(
+  dataset = c(rep('train', nrow(train_set)),
+              rep('test', nrow(test_set)))
+)
+p <- ggplot(data = brent_time,
+            aes(x = timestamp, y = brent, col = dataset)
+) + geom_point(alpha = 0.05) + geom_smooth()
+print(p)
+```
+
+From the plot we can see that the Brent has a completely different distribution in the test set. This, however, seems to have an impact on prices. Let's Brent from our dataset and check further which variables make a big difference
+
+### Plotting the price through time in the training set
+
+```{r}
+p <- ggplot(
+  data = prices,
+  aes(x = timestamp, y = log(1 + price_doc))
+) + geom_point(alpha = 0.01) + geom_smooth()
+print(p)
+```
+
+The striped patterns at the bottom indicate prices that are exactly 1M, 2M and 3M.
+
+```{r}
+p <- p + geom_hline(
+  yintercept = c(log(c(1:3) * 1e06)), 
+  col = "steelblue", alpha = 0.6
+)
+print(p)
+```
+
+## Removing the macro-economic features
+
+It is to be expected that the macro-economic features will follow time-dependent patters. For this reason we should concentrate on the variables that should not have a time dependence. We start removing the macro-economic variables.
+
+```{r no_macro}
+X %<>% select(-c(eurrub:apartment_build))
+X_av_train <- X[idx, ]
+y_av_train <- y[idx]
+X_av_test <- X[-idx, ]
+y_av_test <- y[-idx]
+
+dTrain <- xgb.DMatrix(as.matrix(X_av_train), label = y_av_train)
+dTest <- xgb.DMatrix(as.matrix(X_av_test), label = y_av_test)
+
+cv <- xgb.cv(
+  params = params,
+  data = dTrain,
+  nfold = 10,
+  metrics = 'error',
+  nrounds = 5
+)
+
+nb_rounds <- which.min(cv$evaluation_log$test_error_mean)
+tr <- xgb.train(params = params, data = dTrain, nround = nb_rounds)
+y_pred <- as.numeric(predict(tr, dTest) > 0.5)
+caret::confusionMatrix(y_pred, reference = y_av_test)
+```
+Let's visualize the most important features:
+
+```{r}
+importance <- xgb.importance(
+  feature_names = colnames(dTrain),
+  model = tr
+)
+head(importance, n = 10)
+```
+```{r}
+xgb.plot.importance(importance, top_n = 20)
+```
+From the plot above it seems that there is a difference in the distribution of `state1` houses as well as the `num_room` variable.
+
+**TO DO** It would also be important to make sure that the composition of the most frequent raions doesn't change too much between the training set and the test set.
+
+```{r}
+tmp <- cbind(dataset = ifelse(y == 0, "train", "test"), X)
+round(
+  prop.table(
+    xtabs(~ state1 + dataset, data = tmp), margin = 2),
+  digits = 2)
+```
+We can clearly see that the fraction of `state1` houses is very different in the training and in the test set.
+
+Similarly for the number of rooms
+
+```{r}
+round(
+  prop.table(
+    xtabs(~ num_room + dataset, data = tmp), margin = 2),
+  digits = 2)
+```
+
+These differences don't seem to be enough to explain the difference in the results.
+
+## Simulating the effect of time
+
+Let's consider the case where we split the training set into  `time_train` and a `time_test` sets in order to see which quantities contribute to the increased RMSE.
+
+```{r}
+rm(brent_time, cv, dTest, dTrain, idx, importance, nb_rounds,
+   sub_train, tmp, to_remove, tr, X, X_av_test, X_av_train,
+   y_av_train, y_av_test, y_pred, y, p)
+```
+
+We create now a test set containing all the measurements from 2015.
+
+```{r}
+X <- train_set %>% mutate(
+  year = lubridate::year(timestamp)
+) %>% select(-c(id, timestamp))
+
+idx_train <- X$year < 2015
+idx_test <- X$year == 2015
+
+X$year <- NULL
+y <- log(1 + prices$price_doc)
+X_train <- X[idx_train, ]
+y_train <- y[idx_train]
+X_test <- X[idx_test, ]
+y_test <- y[idx_test]
+```
+
+We can now fit a model on the training set and plot the predicted vs. the actual values to see where the differences come from.
+
+```{r, results="hide"}
+params <- list(
+  eta = 0.2, 
+  gamma = 1,
+  max_depth = 5,
+  min_child_weight = 1,
+  subsample = 0.9,
+  colsample_bytree = 0.9,
+  objective = "reg:linear",
+  nthread = 4
+)
+
+dTrain <- xgb.DMatrix(as.matrix(X_train), label = y_train)
+dTest <- xgb.DMatrix(as.matrix(X_test), label = y_test)
+
+cv <- xgb.cv(
+  params = params,
+  data = dTrain,
+  nfold = 10,
+  metrics = 'rmse',
+  nrounds = 150
+)
+
+nb_rounds <- which.min(cv$evaluation_log$test_rmse_mean)
+tr <- xgb.train(params = params, data = dTrain, nround = nb_rounds)
+preds_train <- predict(tr, dTrain)
+preds_test <- predict(tr, dTest)
+```
+
+Let's inspect the plot for the training set.
+
+```{r}
+res_train <- tibble(y_train, preds_train)
+p_train <- ggplot(res_train, aes(x = y_train, y = preds_train))
+p_train <- p_train +  geom_point(alpha = 0.01) + 
+  geom_abline(slope = 1, intercept = 0, col = 'red') +
+  geom_smooth() +
+  geom_vline(xintercept = log(c(1:3) * 1e6), col = 'grey')
+print(p_train)
+```
+There are two important components: a cear issue with the "round price" transactions, and a downward trend in the plot (the predicted values are systematically lower than the actual one).
+
+Let's see what happens in the test set.
+
+```{r}
+res_test <- tibble(y_test, preds_test)
+p_test <- ggplot(res_test, aes(x = y_test, y = preds_test))
+p_test <- p_test +  geom_point(alpha = 0.05) + 
+  geom_abline(slope = 1, intercept = 0, col = 'red') +
+  geom_smooth() +
+  geom_vline(xintercept = log(c(1:3) * 1e6), col = 'grey')
+print(p_test)
+```
+
+## Exploring the low-price houses
+
+It is clear that the "round price" transactions have an unduly impact on our estimates. Is there any pattern that allows the identification of these transactions. As before, we can turn this into a classification problem.
+
+```{r}
+rm(cv, dTrain, dTest, idx_train, idx_test, nb_rounds, p_test,
+   p_train, preds_test, preds_train, res_test, res_train, tr,
+   X, X_test, X_train, y, y_train, y_test)
+
+prices %<>% mutate(
+  round_price = 1 - as.numeric(price_doc %in% (c(1:3) * 1e6)),
+  price_1m = price_doc == 1e06,
+  price_2m = price_doc == 2e06,
+  price_3m = price_doc == 3e06
+)
+```
+
+As before, we create a training and a test set to identify the variables that are most strongly associated with these transactions.
+
+```{r}
+y <- prices$round_price
+X <- train_set %>%
+  mutate(year = lubridate::year(timestamp),
+         month = lubridate::month(timestamp),
+         day = lubridate::day(timestamp)
+  ) %>% select(-id, -timestamp)
+```
+
+The dataset is extremely unbalanced. We sample randomly as many negatives as we have positives
+
+```{r}
+X_pos <- filter(X, y == 0) # These are the positives
+X_neg <- filter(X, y == 1) %>% sample_n(nrow(X_pos))
+X <- bind_rows(X_pos, X_neg)
+y <- c(rep(0, nrow(X_pos)), rep(1, nrow(X_neg)))
+idx <- sample(1:nrow(X))
+X <- X[idx, ]
+y <- y[idx]
+```
+
+We now create a data partition
+
+```{r}
+idx_train <- createDataPartition(y, p = .8, list = FALSE)
+X_train <- X[idx_train, ]
+y_train <- y[idx_train]
+X_test <- X[-idx_train, ]
+y_test <- y[-idx_train]
+```
+
+We run again an xgboost classifier and check which variables seem to be most strongly associated.
+
+```{r, results="hide"}
+params <- list(
+  eta = 0.1, 
+  gamma = 1,
+  max_depth = 4,
+  min_child_weight = 1,
+  subsample = 0.9,
+  colsample_bytree = 0.9,
+  nthread = 4,
+  objective = "binary:logistic"
+)
+
+dTrain <- xgb.DMatrix(as.matrix(X_train), label = y_train)
+dTest <- xgb.DMatrix(as.matrix(X_test), label = y_test)
+
+cv <- xgb.cv(
+  params = params,
+  data = dTrain,
+  nfold = 10,
+  metrics = 'error',
+  nrounds = 50
+)
+
+nb_rounds <- which.min(cv$evaluation_log$test_error_mean)
+tr <- xgb.train(params = params, data = dTrain, nround = nb_rounds)
+y_pred <- as.numeric(predict(tr, dTest) > 0.5)
+caret::confusionMatrix(y_pred, reference = y_test)
+```
+
+Let's see what are the most important features:
+
+```{r}
+importance <- xgb.importance(colnames(X_train), model = tr)
+xgb.plot.importance(importance, top_n = 20)
+```
+
+### Developing a sub-sampling strategy
+
+Let's take a closer look at the round prices. Our goal is to understand wheather the proportion of such prices is changing through time and, most importantly, to estimate what is the most likely proportion in the test set.
+
+```{r round_prices_through_time}
+n <- nrow(prices)
+
+round_prices_in_time <- prices %>%
+  mutate(month = lubridate::month(timestamp))
+
+yearly_prop_round_prices <- round_prices_in_time %>%
+  group_by(year) %>%
+  summarise(p_1m = sum(price_1m) / n(),
+            p_2m = sum(price_2m) / n(),
+            p_3m = sum(price_3m) / n()
+  ) %>% gather(key = group, value = percentage, p_1m:p_3m)
+
+p <- ggplot(
+  data = yearly_prop_round_prices,
+  aes(x = year, y = percentage, fill = group)) + 
+  geom_bar(stat = "identity", position = position_dodge()
+  )
+print(p)
+```
+
+In the plot above, it is important to note that 2011 and 2015 are not entirely present.
+
+```{r range_2015}
+prices %>% 
+  filter(year == 2015) %>% 
+  summarise(
+    min = min(timestamp),
+    max = max(timestamp)
+  )
+```
+
+Let's discard 2011 and look only at the first 6 months of each year.
+
+```{r}
+round_prices_in_time %<>% 
+  filter(year != 2011, month < 7)
+
+n <- nrow(round_prices_in_time)
+
+semi_yearly_prop_round_prices <- round_prices_in_time %>%
+  group_by(year) %>%
+  summarise(p_1m = sum(price_1m) / n(),
+            p_2m = sum(price_2m) / n(),
+            p_3m = sum(price_3m) / n()
+  ) %>% gather(key = group, value = percentage, p_1m:p_3m)
+
+p <- ggplot(
+  data = semi_yearly_prop_round_prices,
+  aes(x = year, y = percentage, fill = group)) + 
+  geom_bar(stat = "identity", position = position_dodge()
+  )
+print(p)
+```
+
+It's clear that 2011, and partly 2012 had a larger fraction of 1M and 2M transactions.

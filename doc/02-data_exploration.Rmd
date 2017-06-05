@@ -1,0 +1,159 @@
+# Data Exploration
+
+## Reading the data in
+
+Data can be separated in three main groups: training set, test set and
+macroeconomic indicators, from now one referred to as the "macro" set, for
+short.
+
+```{r, message=FALSE}
+library(magrittr)
+library(tidyverse)
+train <- readr::read_csv("../data/train.csv.gz")
+test <- readr::read_csv("../data/test.csv.gz")
+macro <- readr::read_csv("../data/macro.csv.zip")
+dim(train); dim(test); dim(macro)
+```
+
+All the timestamps appearing in the training and in the test set are present in the macro set. We can add a column to each set to identify it.
+
+```{r}
+train$dataset <- "training_set"
+test$dataset <- "test_set"
+```
+
+Only the training set contains the prices in the `price_doc` variable. We can extract it as combine the other datasets.
+
+```{r}
+prices <- train %>% select(id, timestamp, price_doc)
+train$price_doc <- NULL
+stopifnot(all.equal(colnames(train), colnames(test)))
+train_test <- rbind(train, test)
+dim(train_test)
+```
+
+## Data Cleaning
+
+We can use the `clean_dataset` function from the `utilities.R` script to clean-up the dataset. This will only remove some of the issues, but still some cleaning will be required.
+
+```{r data_cleaning}
+source("../R/utilities.R")
+cleaned_train_test <- clean_dataset(
+  dataset = train_test,
+  add_dummies = FALSE,
+  remove_sub_area = FALSE
+)
+rm(train_test)
+```
+
+The cleaned dataset contains `r ncol(cleaned_train_test)` columns. We can remove the numeric columns that contain highly correlated features. For this we separate the numeric and the text features.
+
+```{r find_corrleations}
+time_id <- cleaned_train_test %>% select(id, timestamp)
+cleaned_train_test %<>% select(-c(id, timestamp))
+numeric_vars <- cleaned_train_test %>% map_lgl(is.numeric)
+char_vars <- cleaned_train_test %>% map_lgl(is.character)
+numeric_dataset <- cleaned_train_test[numeric_vars]
+char_dataset <- cleaned_train_test[char_vars]
+tmp <- ncol(numeric_dataset) + ncol(char_dataset)
+stopifnot(tmp == ncol(cleaned_train_test))
+rm(char_vars, numeric_vars)
+```
+
+We use the Caret package to find the highly correlated variables. We need to remove some columns that prevent the calculation of the correlation matrix. We get rid of the variables that have too large a fraction of missing values
+
+```{r remove_numeric_nas}
+pna <- numeric_dataset %>%
+  map_dbl(~ mean(is.na(.x)))
+to_remove <- names(pna)[pna > .4]
+numeric_dataset %<>% select(-one_of(to_remove))
+```
+
+We can use Spearman's correlation, which should be less sensitive to extreme values. In principle, this should fit better with xgboost. In practice, it may not.
+
+```{r}
+library(caret)
+tmp <- as.matrix(numeric_dataset)
+cormat <- cor(tmp, method = "spearman", use = "complete")
+to_remove <- findCorrelation(cormat, names = TRUE)
+numeric_dataset %<>% select(-one_of(to_remove))
+rm(tmp, cormat)
+```
+
+This single operation has removed `r length(to_remove)` columns. We now need to take care of the character variables. For the time being we are retaining the `sub_area`. This variable has `r length(unique(char_dataset$sub_area))` unique entries, which makes it difficult to deal with. In any case we will keep it for further explorations later on.
+
+```{r}
+glimpse(char_dataset)
+```
+
+The dataset seems to be OK. We can have an idea of how many variables are binary.
+
+```{r}
+char_dataset %>% map_int(~length(unique(.x[!is.na(.x)])))
+```
+
+We can put together the numeric and character datasets again
+
+```{r}
+cleaned_train_test <- bind_cols(numeric_dataset, char_dataset)
+rm(numeric_dataset, char_dataset)
+```
+
+## The Macro economic dataset
+
+For some variables up to 70% of the values are missing
+
+```{r}
+pna <- macro %>% map_dbl(~mean(is.na(.x)))
+idx <- order(pna, decreasing = FALSE)
+VIM::aggr(macro[, idx])
+```
+
+We remove the variables that have more than 40% of missing values. This may still not be enough, but is a starting point.
+
+```{r}
+nms <- names(pna)[pna > .4]
+macro %<>% select(-one_of(nms))
+```
+
+
+Some variables are character while they should be numeric
+
+```{r}
+macro %>% map_lgl(is.character) %>% which()
+```
+
+The last one is OK, since it's the one we introduced. We remove the other one because it has very low variance.
+
+```{r}
+macro %<>% select(-child_on_acc_pre_school)
+```
+
+We can get rid of the highly correlated numeric variables as we did before
+
+```{r}
+macro_numeric <- macro[map_lgl(macro, is.numeric)]
+cormat <- cor(macro_numeric, method = "spearman", use = "complete")
+to_remove <- findCorrelation(cormat, names = TRUE)
+macro_numeric %<>% select(-one_of(to_remove))
+```
+
+Based on correlation, we have removed `r length(to_remove)` columns. We can now put together a new macro dataset.
+
+```{r}
+tmp <- macro %>% select(timestamp)
+cleaned_macro <- bind_cols(tmp, macro_numeric)
+rm(tmp, to_remove, cormat, macro_numeric)
+```
+
+We can finaly save the dataset containing the training, test and macro sets in an RData file.
+
+```{r}
+# Put back timestamp and id
+cleaned_train_test <- bind_cols(time_id, cleaned_train_test)
+cleaned_train_test_macro <- inner_join(
+  cleaned_train_test, cleaned_macro, by = "timestamp"
+)
+save(prices, cleaned_train_test_macro, file = "../output/02-data_exploration.RData")
+```
+

@@ -1,0 +1,115 @@
+# Removing 2011
+
+In this chapter we assess the impact of removing all the data from 2011. This may be a bit too drastic, and neglects the fact that similar issues are present, at least partly, in 2012. We use the last year as a validation set
+
+```{r}
+library(magrittr)
+library(tidyverse)
+library(xgboost)
+load("../output/08-final_dataset.RData")
+```
+
+Let's remove all the entries from 2011 in the trainin set
+
+```{r}
+train_set %<>% filter(prices$year > 2011)
+```
+
+We first examine the range of dates in the test set.
+
+```{r}
+print(range(test_set$timestamp))
+print(diff(range(test_set$timestamp)))
+```
+
+The dataset contains 8 months of data. We create a validation set containing the last 4 months of the training set.
+
+```{r}
+print(max(train_set$timestamp))
+val_set <- train_set %>% filter(timestamp >= "2015-02-01")
+prices_val <- prices %>% filter(id %in% val_set$id)
+
+train_set %<>% filter(timestamp < "2015-02-01")
+prices_train <- prices %>% filter(id %in% train_set$id)
+
+print(diff(range(val_set$timestamp)))
+```
+
+We now create an xgboost model to assess how accurately we can predict the validation set, and how off we are in our predictions on the public leaderboard.
+
+```{r}
+X_tr <- train_set %>%
+  mutate(year = lubridate::year(timestamp)) %>%
+  select(-c(id, timestamp)) %>% as.matrix()
+X_val <- val_set %>% 
+  mutate(year = lubridate::year(timestamp)) %>%
+  select(-c(id, timestamp)) %>% as.matrix()
+X_test <- test_set %>%
+  mutate(year = lubridate::year(timestamp)) %>%
+  select(-c(id, timestamp)) %>% as.matrix()
+X_train <- rbind(X_tr, X_val)
+
+y_tr <- log(1 + prices_train$price_doc)
+y_val <- log(1 + prices_val$price_doc)
+y_train <- c(y_tr, y_val)
+
+dTr <- xgb.DMatrix(X_tr, label = y_tr)
+dVal <- xgb.DMatrix(X_val, label = y_val)
+dTrain <- xgb.DMatrix(X_train, label = y_train)
+dTe <- xgb.DMatrix(X_test)
+```
+
+We build a model based on a watchlist containing the validation set.
+
+```{r, results="hide"}
+watchlist <- list(eval = dVal, train = dTr)
+
+param <- list(
+  eta = 0.1,
+  nthread = 4,
+  objective = "reg:linear",
+  eval_metric = "rmse",
+  gamma = 1,
+  max_depth = 4,
+  min_child_weight = 1,
+  subsample = .8,
+  colsample_by_tree = .8
+)
+
+tr <- xgb.train(
+  params = param, 
+  data = dTr, 
+  nrounds = 300, 
+  watchlist = watchlist
+)
+```
+
+We obtain a not very impressive performance.
+
+```{r}
+nround <- which.min(tr$evaluation_log$eval_rmse)
+print(tr$evaluation_log[nround, ])
+```
+
+We can check where we are going wrong in the validation set.
+
+```{r}
+pred_val <- predict(tr, dVal)
+res_df <- tibble(y_val, pred_val)
+p <- ggplot(res_df, aes(x = y_val, y = pred_val)) +
+  geom_point(alpha = 0.1) + 
+  geom_abline(slope = 1, intercept = 0) +
+  geom_smooth()
+print(p)
+```
+
+Clearly we are still predicting too many "round priced" transactions. This is probably due to the influence of the 2012 observations.
+
+We now train the model on the full set and assess the performance
+
+```{r}
+full_tr <- xgb.train(params = param, data = dTrain, nrounds = nround)
+preds <- predict(full_tr, dTe)
+submission <- tibble(id = test_set$id, price_doc = exp(preds))
+write_csv(submission, path = "../output/submission_no_2011.csv")
+```

@@ -1,0 +1,112 @@
+# The Macro Dataset
+
+```{r}
+library(magrittr)
+library(tidyverse)
+load("../output/essential_aera_raion_demo_macro.RData")
+macro <- inner_join(prices, macro)
+```
+
+We remove the id variable and add some time-related variables, namely year, month and week.
+
+```{r}
+macro_timestamp <- macro$timestamp
+macro %<>% select(-id) %>%
+  mutate(year = lubridate::year(timestamp),
+         month = lubridate::month(timestamp),
+         week = lubridate::week(timestamp),
+         price = log(1 + price_doc)) %>%
+  select(-timestamp)
+```
+
+## XGBoost model
+
+```{r}
+library(xgboost)
+y <- macro$price
+X <- macro %>% select(-c(price_doc, price)) %>% as.matrix()
+
+params <- list(
+  eta = 0.1, 
+  gamma = 1,
+  max_depth = 5,
+  min_child_weight = 1,
+  subsample = 0.9,
+  colsample_bytree = 0.9,
+  objective = "reg:linear")
+
+dTr <- xgb.DMatrix(X, label = y)
+
+set.seed(123)
+cv <- xgb.cv(params = params, data = dTr, nrounds = 300, nfold = 5)
+tr <- xgb.train(
+  params = params, 
+  data = dTr, 
+  nrounds = which.min(cv$evaluation_log$test_rmse_mean)
+)
+imp <- xgb.importance(colnames(X), model = tr)
+xgb.plot.importance(imp)
+xgb_to_keep <- filter(imp, Importance > 0.01)
+xgb_to_keep <- xgb_to_keep$Feature
+```
+
+## Glmnet
+
+```{r}
+library(glmnet)
+library(caret)
+bc <- preProcess(X, method = "BoxCox")
+X <- predict(bc, X)
+idx <- complete.cases(X)
+X <- X[idx, ]
+y <- y[idx]
+cv <- cv.glmnet(X, y, type.measure = "mse")
+plot(cv)
+```
+
+It seems that there are just 10 variables or so that are somewhat relevant.
+
+```{r}
+fit <- glmnet(X, y, lambda = cv$lambda.min)
+tmp <- coef(fit)
+glm_to_keep <- rownames(tmp)[tmp[, 1] != 0][-1] # Intercept
+```
+
+### Final selection
+
+We keep the predictors selected by both methods
+
+```{r, eval=FALSE}
+to_keep <- unique(c(xgb_to_keep, glm_to_keep))
+macro %<>% select(one_of(to_keep))
+macro$timestamp <- macro_timestamp
+save(macro, file = "../output/05-macro_dataset.RData")
+```
+
+### Alternative Approach
+
+We select the variables recommended by Roberto Ruiz in [this kernel](https://www.kaggle.com/robertoruiz/dealing-with-multicollinearity/notebook/notebook) (look at the bottom of the post).
+
+```{r}
+vif_to_keep <- c(
+  "year",
+  "balance_trade",
+  "balance_trade_growth",
+  "eurrub",
+  "average_provision_of_build_contract",
+  "micex_rgbi_tr",
+  # "micex_cbi_tr",
+  "deposits_rate",
+  "mortgage_value",
+  "mortgage_rate",
+  "income_per_cap",
+  # "rent_price_4.room_bus",
+  # "museum_visitis_per_100_cap",
+  "apartment_build"
+)
+
+to_keep <- union(xgb_to_keep, vif_to_keep)
+macro %<>% select(one_of(to_keep))
+macro$timestamp <- macro_timestamp
+save(macro, file = "../output/05-macro_dataset.RData")
+```

@@ -1,0 +1,75 @@
+# The Area Dataset
+
+```{r}
+library(magrittr)
+library(tidyverse)
+load("../output/essential_aera_raion_demo_macro.RData")
+```
+
+The `area` dataset is the largest, containing `r ncol(area)` columns. All the variables containing `count` in the names are, well, counts. The variables starting with `ID_` are actually categorical and not numeric. There are `r sum(grepl('^ID_', names(area)))` such columns. Intuitively, it seems more relevant that there is a bus/train/metro station nearby, rather than the actual number of the line. We drop these columns since they contain quite a lot of values (see below)
+
+```{r}
+area %>% select(starts_with("ID_")) %>% map(unique)
+area %<>% select(-starts_with("ID_"))
+```
+
+There are a few character columns. They seem to be mostly binary variables
+
+```{r}
+area_char <- area %>% map_lgl(is.character) %>% which()
+area_char
+```
+
+Let's verify that they are actually binary
+
+```{r}
+area %>% select(area_char) %>% map_int(~length(unique(.x)))
+```
+Yes, they are all binary. We convert them to dichotomous variables.
+
+```{r}
+foo <- function(x) {ifelse(x == 'yes', 1, 0)}
+area %<>% mutate(
+   culture_objects_top_25 = foo(culture_objects_top_25),
+   water_1line = foo(water_1line),
+   big_road1_1line = foo(big_road1_1line),
+   railroad_1line = foo(railroad_1line)
+)
+any(map_lgl(area, is.character))
+```
+
+## Selecting the area variables with XGBoost
+
+If we run an xgboost model on the `area` dataset, and try to predict the prices on the pseudo-test set shown below, we find that the best number of rounds is around 720. 
+```{r, eval=TRUE, cache=TRUE}
+library(xgboost)
+X <- as.matrix(area)
+y <- y_train
+
+params <- list(
+  eta = 0.1, 
+  gamma = 1,
+  max_depth = 5,
+  min_child_weight = 1,
+  subsample = 0.9,
+  colsample_bytree = 0.9,
+  objective = "reg:linear")
+
+dTr <- xgb.DMatrix(X, label = y)
+
+set.seed(123)
+cv <- xgb.cv(params = params, data = dTr, nrounds = 500, nfold = 5)
+tr <- xgb.train(params = params, data = dTr, 
+                nrounds = which.min(cv$evaluation_log$test_rmse_mean))
+imp <- xgb.importance(colnames(X), model = tr)
+xgb.plot.importance(imp)
+to_keep <- filter(imp, Importance > 0.01)
+area <- select(area, one_of(to_keep$Feature))
+```
+
+To start with, we can retain only the variables with an importance above 0.01. This has left `r ncol(area)` features in the area dataset.
+
+```{r}
+save(area, file = "../output/04-area_dataset.RData")
+```
+

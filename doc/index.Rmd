@@ -1,0 +1,15 @@
+---
+title: "The Sberbank Kaggle Competition"
+author: "Giovanni d'Ario"
+site: bookdown::bookdown_site
+documentclass: book
+output:
+  bookdown::gitbook: default
+  bookdown::pdf_book: default
+---
+
+# Preface {-}
+
+This document shows various attempts at analyzing the Sberbank dataset, from
+the Kaggle competition hosted in May-June 2017.
+

@@ -1,0 +1,92 @@
+# Further analysis of the round-priced transactions
+
+```{r}
+library(magrittr)
+library(tidyverse)
+load("../output/08-final_dataset.RData")
+prices %<>% filter(
+  !(price_doc %in% c(1e06, 2e06, 3e06)),
+  price_doc > exp(14.3)
+)
+
+sub_train_set <- train_set %>% filter(id %in% prices$id)
+```
+
+## XGBoost model
+
+```{r}
+library(xgboost)
+val_set <- sub_train_set %>% filter(timestamp >= "2015-02-01")
+prices_val <- prices %>% filter(id %in% val_set$id)
+
+sub_train_set %<>% filter(timestamp < "2015-02-01")
+prices_train <- prices %>% filter(id %in% sub_train_set$id)
+
+X_tr <- sub_train_set %>%
+  mutate(year = lubridate::year(timestamp)) %>%
+  select(-c(id, timestamp)) %>% as.matrix()
+X_val <- val_set %>% 
+  mutate(year = lubridate::year(timestamp)) %>%
+  select(-c(id, timestamp)) %>% as.matrix()
+X_test <- test_set %>%
+  mutate(year = lubridate::year(timestamp)) %>%
+  select(-c(id, timestamp)) %>% as.matrix()
+X_train <- rbind(X_tr, X_val)
+
+y_tr <- log(1 + prices_train$price_doc)
+y_val <- log(1 + prices_val$price_doc)
+y_train <- c(y_tr, y_val)
+
+dTr <- xgb.DMatrix(X_tr, label = y_tr)
+dVal <- xgb.DMatrix(X_val, label = y_val)
+dTrain <- xgb.DMatrix(X_train, label = y_train)
+dTe <- xgb.DMatrix(X_test)
+```
+
+Model fit 
+
+```{r, results="hide"}
+watchlist <- list(eval = dVal, train = dTr)
+
+param <- list(
+  eta = 0.1,
+  nthread = 4,
+  objective = "reg:linear",
+  eval_metric = "rmse",
+  gamma = 1,
+  max_depth = 6,
+  min_child_weight = 1,
+  subsample = .7,
+  colsample_by_tree = .8
+)
+
+tr <- xgb.train(
+  params = param, 
+  data = dTr, 
+  nrounds = 1000, 
+  watchlist = watchlist
+)
+
+nround <- which.min(tr$evaluation_log$eval_rmse)
+
+pred_val <- predict(tr, dVal)
+res_df <- tibble(y_val, pred_val)
+p <- ggplot(res_df, aes(x = y_val, y = pred_val)) +
+  geom_point(alpha = 0.1) + 
+  geom_abline(slope = 1, intercept = 0) +
+  geom_smooth()
+print(p)
+```
+
+Let's create a submission
+
+```{r}
+full_tr <- xgb.train(params = param, data = dTrain, nrounds = nround)
+preds <- predict(full_tr, dTe)
+submission <- tibble(id = test_set$id, price_doc = exp(preds))
+write_csv(
+  submission, 
+  path = "../output/submission_no_extreme_values.csv"
+)
+```
+

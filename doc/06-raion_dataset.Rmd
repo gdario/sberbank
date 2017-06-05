@@ -1,0 +1,124 @@
+# The Raion Dataset
+
+We want to know whether the raion-specific information is constant for a given raion (maybe within one year).
+
+```{r}
+library(magrittr)
+library(tidyverse)
+load("../output/essential_aera_raion_demo_macro.RData")
+raion <- bind_cols(prices, raion)
+raion$year <- lubridate::year(raion$timestamp)
+raion$sub_area <- essential$sub_area
+raion$timestamp <- NULL
+```
+
+We can check whether there is one record for each combination of year and `sub_area` or if there are more.
+
+```{r}
+tmp <- select(raion, -id, -price_doc, -timestamp) %>%
+  arrange(sub_area, year) %>%
+  distinct()
+tmp %>% select(year, sub_area) %>% duplicated() %>% any()
+```
+
+The correspondence is one-to-one. It does not make sense to check the association of these variables with each single transaction, but rather to compare it with the average prices per year and per raion.
+
+```{r}
+tmp <- select(raion, -c(id, timestamp))
+tmp$full_sq <- essential$full_sq
+yearly_price_raion <- tmp %>% 
+  group_by(year, sub_area) %>%
+  mutate(mean_price_sqm = mean(price_doc / full_sq)) %>%
+  select(-c(price_doc, full_sq)) %>%
+  ungroup() %>%
+  distinct()
+```
+
+We can see whether there is any association between the mean log price per square meter and the raion parameters.
+
+### GLMNET model
+
+We start creating the dummy variables for the character columns.
+
+```{r}
+library(caret)
+y <- log(1 + yearly_price_raion$mean_price_sqm)
+yearly_price_raion$mean_price_sqm <- NULL
+tmp_char <- yearly_price_raion[map_lgl(
+  yearly_price_raion, is.character)]
+tmp_num <- yearly_price_raion[map_lgl(
+  yearly_price_raion, is.numeric)]
+tmp_char$sub_area <- NULL
+d <- dummyVars(~ ., tmp_char, fullRank = TRUE)
+dummies <- predict(d, tmp_char)
+```
+
+and we transform the numeric variables with the exception of the year
+
+```{r}
+year <- tmp_num$year
+X <- as.matrix(tmp_num)[, -match('year', colnames(tmp_num))]
+bc <- preProcess(X, method = "BoxCox")
+X <- predict(bc, X)
+X <- cbind(X, year, dummies)
+```
+
+We can now fit a GLMNET model, but we need to remove the missing values first.
+
+```{r glmnet_raion}
+library(glmnet)
+idx <- complete.cases(X) & complete.cases(y)
+X <- X[idx, ]
+y <- y[idx]
+set.seed(666)
+cv <- cv.glmnet(X, y)
+fit <- glmnet(X, y, lambda = cv$lambda.min)
+cf <- coef(fit)
+glm_to_keep <- rownames(cf)[cf[, 1] != 0][-1]
+```
+
+### XGBoost Model
+
+```{r, message=FALSE}
+library(xgboost)
+
+params <- list(
+  eta = 0.1, 
+  gamma = 1,
+  max_depth = 5,
+  min_child_weight = 1,
+  subsample = 0.9,
+  colsample_bytree = 0.9,
+  objective = "reg:linear")
+
+dTr <- xgb.DMatrix(X, label = y)
+
+set.seed(666)
+cv <- xgb.cv(params = params, data = dTr, nrounds = 300, nfold = 5)
+tr <- xgb.train(
+  params = params, 
+  data = dTr, 
+  nrounds = which.min(cv$evaluation_log$test_rmse_mean)
+)
+imp <- xgb.importance(colnames(X), model = tr)
+xgb.plot.importance(imp)
+xgb_to_keep <- filter(imp, Importance > 0.01)
+xgb_to_keep <- xgb_to_keep$Feature
+```
+
+As in the previous case, we retain the union of the variables
+
+```{r}
+to_keep <- union(glm_to_keep, xgb_to_keep)
+to_keep <- gsub("yes$", "", to_keep)
+stopifnot(all(to_keep %in% colnames(yearly_price_raion)))
+yearly_price_raion %<>% select(sub_area, one_of(to_keep))
+prices %<>% mutate(
+  year = lubridate::year(timestamp),
+  sub_area = raion$sub_area
+)
+raion <- inner_join(prices, yearly_price_raion,
+                            by = c("year", "sub_area"))
+save(raion, file = "../output/06-raion_dataset.Rmd")
+```
+

@@ -1,0 +1,110 @@
+# The Demographic Dataset
+
+We want to know whether the demographic information is constant for a given raion for a given year. We expect the demographic information to be raion and time specific.
+
+```{r}
+library(magrittr)
+library(tidyverse)
+load("../output/essential_aera_raion_demo_macro.RData")
+demographic <- bind_cols(prices[, -2], demographic)
+demographic$year <- lubridate::year(demographic$timestamp)
+demographic$sub_area <- essential$sub_area
+# demographic$timestamp <- NULL
+```
+
+We can check whether there is one record for each combination of year and `sub_area` or if there are more.
+
+```{r}
+tmp <- select(demographic, -c(id, timestamp, price_doc)) %>%
+  arrange(sub_area, year) %>%
+  distinct()
+tmp %>% select(year, sub_area) %>% duplicated() %>% any()
+```
+
+As for the raion, the correspondence is one-to-one. It does not make sense to check the association of these variables with each single transaction, but rather to compare it with the average prices per year and per raion.
+
+```{r}
+tmp <- select(demographic, -c(id, timestamp))
+tmp$full_sq <- essential$full_sq
+yearly_price_demo <- tmp %>% 
+  group_by(year, sub_area) %>%
+  mutate(mean_price_sqm = mean(price_doc / full_sq)) %>%
+  select(-c(price_doc, full_sq)) %>%
+  ungroup() %>%
+  distinct()
+```
+
+We can see whether there is any association between the mean log price per square meter and the raion parameters.
+
+### GLMNET model
+
+
+```{r}
+library(caret)
+y <- log(1 + yearly_price_demo$mean_price_sqm)
+X <- yearly_price_demo %>% select(-c(mean_price_sqm, sub_area))
+X <- as.matrix(X)
+idx <- match("year", colnames(X))
+bc <- preProcess(X[, -idx], method = "BoxCox")
+X[, -idx] <- predict(bc, X[, -idx])
+```
+
+We can now fit a GLMNET model, but we need to remove the missing values first.
+
+```{r glmnet_rion}
+library(glmnet)
+idx <- complete.cases(X) & complete.cases(y)
+X <- X[idx, ]
+y <- y[idx]
+set.seed(666)
+cv <- cv.glmnet(X, y)
+fit <- glmnet(X, y, lambda = cv$lambda.min)
+cf <- coef(fit)
+glm_to_keep <- rownames(cf)[cf[, 1] != 0][-1]
+```
+
+### XGBoost Model
+
+```{r, results=FALSE, message=FALSE}
+library(xgboost)
+
+params <- list(
+  eta = 0.1, 
+  gamma = 1,
+  max_depth = 5,
+  min_child_weight = 1,
+  subsample = 0.9,
+  colsample_bytree = 0.9,
+  objective = "reg:linear")
+
+dTr <- xgb.DMatrix(X, label = y)
+
+set.seed(666)
+cv <- xgb.cv(params = params, data = dTr, nrounds = 300, nfold = 5)
+tr <- xgb.train(
+  params = params, 
+  data = dTr, 
+  nrounds = which.min(cv$evaluation_log$test_rmse_mean)
+)
+imp <- xgb.importance(colnames(X), model = tr)
+xgb.plot.importance(imp)
+xgb_to_keep <- filter(imp, Importance > 0.01)
+xgb_to_keep <- xgb_to_keep$Feature
+```
+
+As in the previous case, we retain the union of the variables
+
+```{r}
+to_keep <- union(glm_to_keep, xgb_to_keep)
+to_keep <- gsub("yes$", "", to_keep)
+stopifnot(all(to_keep %in% colnames(yearly_price_demo)))
+yearly_price_demo %<>% select(sub_area, one_of(to_keep))
+prices %<>% mutate(
+  year = lubridate::year(timestamp),
+  sub_area = demographic$sub_area
+)
+demographic <- inner_join(prices, yearly_price_demo,
+                            by = c("year", "sub_area"))
+save(demographic, file = "../output/07-demographics_dataset.Rmd")
+```
+
